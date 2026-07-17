@@ -459,7 +459,8 @@ test("같은 실행 ID로 재시작하면 DART 목록 지연에도 저장된 체
       }
     ];
   };
-  const fetchJsonImpl = async (url) => {
+  const fetchJsonImpl = async (url, requestOptions) => {
+    assert.equal(requestOptions?.retries, 0);
     apiCalls += 1;
     const endpoint = new URL(url).pathname.split("/").at(-1);
     const parameters = new URL(url).searchParams;
