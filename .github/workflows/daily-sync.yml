@@ -16,7 +16,8 @@ permissions:
 jobs:
   sync:
     runs-on: ubuntu-latest
-    timeout-minutes: 180
+    # 첫 전체시장 재무 갱신이 약 173분 소요되어 일시적인 API 지연 여유를 둡니다.
+    timeout-minutes: 300
 
     steps:
       - name: Check out repository
