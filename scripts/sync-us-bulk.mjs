@@ -17,6 +17,7 @@ import { pipeline } from "node:stream/promises";
 import { pathToFileURL } from "node:url";
 
 import { getRuntimeConfig, ROOT_DIR } from "../lib/config.mjs";
+import { buildSecRequestHeaders } from "../lib/providers/sec-identity.mjs";
 import {
   normalizeSecCompany,
   normalizeSecTickerUniverse,
@@ -48,6 +49,84 @@ function redactSensitive(value) {
   return String(value || "")
     .replace(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi, "[redacted-email]")
     .slice(0, 2_000);
+}
+
+function downloadWithCurl(
+  url,
+  destination,
+  {
+    userAgent,
+    label,
+    timeoutMs,
+    spawnImpl = spawn,
+    executable = process.platform === "win32" ? "curl.exe" : "curl"
+  }
+) {
+  return new Promise((resolve, reject) => {
+    const identityHeaders = buildSecRequestHeaders(userAgent);
+    const args = [
+      "--location",
+      "--silent",
+      "--show-error",
+      "--compressed",
+      "--connect-timeout",
+      "30",
+      "--max-time",
+      String(Math.max(1, Math.ceil(timeoutMs / 1_000))),
+      "--user-agent",
+      identityHeaders["User-Agent"],
+      ...(identityHeaders.From ? ["--header", "From: " + identityHeaders.From] : []),
+      "--header",
+      "Accept: application/octet-stream, application/json;q=0.9",
+      "--output",
+      destination,
+      "--write-out",
+      "%{http_code}",
+      "--",
+      url
+    ];
+    const child = spawnImpl(executable, args, {
+      cwd: ROOT_DIR,
+      stdio: ["ignore", "pipe", "pipe"]
+    });
+    let stdout = "";
+    let stderr = "";
+    let settled = false;
+
+    child.stdout?.on("data", (chunk) => {
+      stdout = (stdout + chunk.toString("utf8")).slice(-1_000);
+    });
+    child.stderr?.on("data", (chunk) => {
+      stderr = (stderr + chunk.toString("utf8")).slice(-2_000);
+    });
+    child.once("error", (error) => {
+      if (settled) return;
+      settled = true;
+      reject(new Error(label + " curl 실행 실패: " + redactSensitive(error.message)));
+    });
+    child.once("close", (code) => {
+      if (settled) return;
+      settled = true;
+      const status = Number.parseInt(stdout.trim().slice(-3), 10);
+      if (code !== 0) {
+        reject(
+          new Error(
+            label +
+              " curl 다운로드 실패(종료 코드 " +
+              code +
+              "): " +
+              redactSensitive(stderr)
+          )
+        );
+        return;
+      }
+      if (!Number.isInteger(status) || status < 200 || status >= 300) {
+        reject(new Error(label + " 응답 실패(HTTP " + (status || "unknown") + ")"));
+        return;
+      }
+      resolve({ transport: "curl", httpStatus: status });
+    });
+  });
 }
 
 function parseInteger(value, fallback) {
@@ -109,7 +188,10 @@ export async function downloadToFile(
     label = "SEC bulk file",
     retries = 3,
     timeoutMs = DEFAULT_DOWNLOAD_TIMEOUT_MS,
-    fetchImpl = fetch
+    fetchImpl = fetch,
+    curlFallback = fetchImpl === fetch,
+    curlSpawnImpl = spawn,
+    curlExecutable
   } = {}
 ) {
   if (!userAgent) throw new Error("SEC_USER_AGENT가 설정되지 않았습니다.");
@@ -121,11 +203,12 @@ export async function downloadToFile(
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs);
     try {
+      const identityHeaders = buildSecRequestHeaders(userAgent);
       const response = await fetchImpl(url, {
         headers: {
           Accept: "application/octet-stream, application/json;q=0.9",
           "Accept-Encoding": "gzip, deflate",
-          "User-Agent": userAgent
+          ...identityHeaders
         },
         redirect: "follow",
         signal: controller.signal
@@ -134,6 +217,24 @@ export async function downloadToFile(
       if (!response.ok || !response.body) {
         const retryable = response.status === 429 || response.status >= 500;
         await response.body?.cancel().catch(() => {});
+        if (response.status === 403 && curlFallback) {
+          const curlMetadata = await downloadWithCurl(url, temporary, {
+            userAgent,
+            label,
+            timeoutMs,
+            spawnImpl: curlSpawnImpl,
+            executable: curlExecutable
+          });
+          await rename(temporary, destination);
+          const file = await stat(destination);
+          return {
+            bytes: file.size,
+            etag: null,
+            lastModified: null,
+            contentLength: String(file.size),
+            ...curlMetadata
+          };
+        }
         if (retryable && attempt < retries) {
           await sleep(1_000 * 2 ** attempt);
           continue;

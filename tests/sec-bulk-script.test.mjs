@@ -1,9 +1,11 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
+import { EventEmitter } from "node:events";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { PassThrough } from "node:stream";
 
 import {
   assertPruneCoverage,
@@ -26,8 +28,10 @@ test("SEC bulk 다운로드는 선언된 User-Agent를 보내되 결과·오류�
   const destination = path.join(directory, "fixture.zip");
   const userAgent = "Longview Screener private-contact@example.com";
   let receivedUserAgent = null;
+  let receivedFrom = null;
   const fetchImpl = async (_url, options) => {
     receivedUserAgent = options.headers["User-Agent"];
+    receivedFrom = options.headers.From;
     return new Response(Buffer.from("PK\u0003\u0004fixture"), {
       status: 200,
       headers: {
@@ -43,7 +47,8 @@ test("SEC bulk 다운로드는 선언된 User-Agent를 보내되 결과·오류�
       fetchImpl,
       retries: 0
     });
-    assert.equal(receivedUserAgent, userAgent);
+    assert.equal(receivedUserAgent, "Longview-Screener/1.0");
+    assert.equal(receivedFrom, "private-contact@example.com");
     assert.equal((await readFile(destination)).subarray(0, 2).toString("ascii"), "PK");
     assert.equal(metadata.etag, "fixture-etag");
     assert.equal(JSON.stringify(metadata).includes("private-contact"), false);
@@ -62,6 +67,59 @@ test("SEC bulk 다운로드는 선언된 User-Agent를 보내되 결과·오류�
         return true;
       }
     );
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("SEC fetch가 403이면 shell 없이 curl 전송으로 안전하게 재시도한다", async () => {
+  const directory = await mkdtemp(path.join(tmpdir(), "longview-sec-curl-test-"));
+  const destination = path.join(directory, "fixture.json");
+  const userAgent = "Longview Screener private-contact@example.com";
+  let received = null;
+  const deniedFetch = async () => new Response("denied", { status: 403 });
+  const curlSpawnImpl = (executable, args, options) => {
+    received = { executable, args, options };
+    const child = new EventEmitter();
+    child.stdout = new PassThrough();
+    child.stderr = new PassThrough();
+    queueMicrotask(async () => {
+      const outputIndex = args.indexOf("--output");
+      await writeFile(args[outputIndex + 1], '{"ok":true}', "utf8");
+      child.stdout.end("200");
+      child.stderr.end();
+      child.emit("close", 0);
+    });
+    return child;
+  };
+
+  try {
+    const metadata = await downloadToFile(
+      "https://www.sec.gov/files/company_tickers_exchange.json",
+      destination,
+      {
+        userAgent,
+        fetchImpl: deniedFetch,
+        curlFallback: true,
+        curlSpawnImpl,
+        retries: 0
+      }
+    );
+
+    assert.match(received.executable, /^curl(?:\.exe)?$/);
+    assert.equal(received.options.shell, undefined);
+    assert.equal(
+      received.args[received.args.indexOf("--user-agent") + 1],
+      "Longview-Screener/1.0"
+    );
+    assert.equal(
+      received.args.includes("From: private-contact@example.com"),
+      true
+    );
+    assert.equal(received.args.at(-1), "https://www.sec.gov/files/company_tickers_exchange.json");
+    assert.equal(await readFile(destination, "utf8"), '{"ok":true}');
+    assert.equal(metadata.transport, "curl");
+    assert.equal(JSON.stringify(metadata).includes("private-contact"), false);
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
