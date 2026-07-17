@@ -1,0 +1,107 @@
+name: Daily full-market disclosure sync
+
+on:
+  schedule:
+    # 19:35 KST. SEC bulk archives are republished around 03:00 ET.
+    - cron: "35 10 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: full-market-disclosure-sync
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Restore DART universe checkpoints
+        uses: actions/cache/restore@v4
+        with:
+          path: data/dart-market
+          key: dart-market-${{ runner.os }}-${{ github.run_id }}
+          restore-keys: |
+            dart-market-${{ runner.os }}-
+
+      - name: Validate collectors and scoring
+        run: |
+          npm run check
+          python -m unittest discover -s tests -p "test_*.py"
+
+      - name: Preserve previous public snapshot baseline
+        run: |
+          if [ -f data/companies.json ]; then
+            cp data/companies.json "$RUNNER_TEMP/previous-companies.json"
+          fi
+
+      - name: Sync KOSPI, KOSDAQ, NYSE, Nasdaq and CBOE
+        id: market_sync
+        continue-on-error: true
+        run: npm run sync:daily
+        env:
+          DART_API_KEY: ${{ secrets.DART_API_KEY }}
+          SEC_USER_AGENT: ${{ secrets.SEC_USER_AGENT }}
+          PYTHON: python
+
+      - name: Validate generated snapshot
+        id: snapshot_validation
+        if: steps.market_sync.outcome == 'success'
+        run: |
+          if [ -f "$RUNNER_TEMP/previous-companies.json" ]; then
+            npm run validate:snapshot -- --previous "$RUNNER_TEMP/previous-companies.json"
+          else
+            npm run validate:snapshot
+          fi
+
+      - name: Save DART universe checkpoints
+        if: always()
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: data/dart-market
+          key: dart-market-${{ runner.os }}-${{ github.run_id }}
+
+      - name: Upload sync diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: full-market-sync-diagnostics-${{ github.run_id }}
+          path: |
+            data/sync-diagnostics.json
+            data/us-sync-diagnostics.json
+          if-no-files-found: ignore
+          retention-days: 14
+
+      - name: Commit updated public snapshot
+        if: steps.market_sync.outcome == 'success' && steps.snapshot_validation.outcome == 'success'
+        run: |
+          if [ -z "$(git status --porcelain -- data/companies.json)" ]; then
+            echo "No public snapshot changes"
+            exit 0
+          fi
+          git config user.name "longview-data-bot"
+          git config user.email "longview-data-bot@users.noreply.github.com"
+          git add data/companies.json
+          git commit -m "data: daily full-market snapshot"
+          git push
+
+      - name: Fail when a market collector failed
+        if: steps.market_sync.outcome == 'failure'
+        run: exit 1

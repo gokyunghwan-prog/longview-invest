@@ -1,0 +1,17 @@
+.env*
+!.env.example
+.DS_Store
+node_modules/
+coverage/
+.cache/
+data/.sync-lock
+data/*.tmp
+data/**/*.tmp
+data/*.tmp-*
+data/**/*.tmp-*
+data/dart-market/
+data/us-companies.json
+data/*diagnostics.json
+*.log
+__pycache__/
+*.pyc

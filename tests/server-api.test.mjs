@@ -1,0 +1,174 @@
+import test from "node:test";
+import assert from "node:assert/strict";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
+import { createLongviewApp } from "../server.mjs";
+
+const UPDATED_AT = "2026-07-17T00:00:00.000Z";
+
+function company(index, overrides = {}) {
+  const ticker = String(index).padStart(6, "0");
+  return {
+    id: "KR-" + ticker,
+    name: "테스트 기업 " + ticker,
+    nameEn: "Test Company " + ticker,
+    ticker,
+    country: "KR",
+    exchange: "KOSPI",
+    sector: index % 2 ? "정보기술" : "소재",
+    period: "2025 사업연도",
+    statementBasis: "K-IFRS · 연결재무제표",
+    dataMode: "live",
+    metrics: {
+      roe: 25,
+      operatingMargin: 25,
+      netMargin: 20,
+      revenueGrowth: 20,
+      operatingIncomeGrowth: 25,
+      debtRatio: 50,
+      currentRatio: 200,
+      fcfMargin: 20,
+      cashConversion: 130,
+      positiveIncomeYears: 3,
+      revenueStability: 95,
+      per: null
+    },
+    history: [
+      { label: "2023", revenue: 100, operatingIncome: 20 },
+      { label: "2024", revenue: 120, operatingIncome: 24 },
+      { label: "2025", revenue: 150, operatingIncome: 32 }
+    ],
+    historyUnit: "KRW billion",
+    disclosures: [
+      {
+        id: "filing-" + ticker,
+        title: "사업보고서",
+        form: "사업보고서",
+        date: "2026-07-10",
+        url: "https://example.com/filing/" + ticker
+      }
+    ],
+    latestDisclosure: { date: "2026-07-10" },
+    sourceUrl: "https://example.com/company/" + ticker,
+    lineage: { provider: "Open DART", filingId: "filing-" + ticker },
+    validation: { score: 100 },
+    riskFlags: [],
+    stale: false,
+    updatedAt: UPDATED_AT,
+    ...overrides
+  };
+}
+
+function snapshot(companies, updatedAt = UPDATED_AT) {
+  return {
+    meta: {
+      schemaVersion: 1,
+      dataMode: "live",
+      updatedAt,
+      note: "API 테스트",
+      sources: [],
+      sync: {
+        status: "partial",
+        successful: companies.length,
+        attempted: companies.length + 1,
+        failed: 1,
+        errors: [{ company: "숨김", message: "응답에서 제외" }]
+      }
+    },
+    companies
+  };
+}
+
+test("overview, paginated list, detail, ETag와 reload가 함께 동작한다", async (t) => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "longview-api-"));
+  const dataFile = path.join(directory, "companies.json");
+  const publicDir = path.join(directory, "public");
+  await mkdir(publicDir);
+  let companies = [company(1), company(2), company(3, { country: "US", id: "US-TEST" })];
+  await writeFile(dataFile, JSON.stringify(snapshot(companies)), "utf8");
+
+  const config = {
+    dataFile,
+    publicDir,
+    host: "127.0.0.1",
+    port: 0,
+    schedulerEnabled: false,
+    scheduleHourKst: 7,
+    syncToken: "test-token"
+  };
+  const syncRunner = async () => {
+    companies = [...companies, company(4), company(5)];
+    await writeFile(
+      dataFile,
+      JSON.stringify(snapshot(companies, "2026-07-19T00:00:00.000Z")),
+      "utf8"
+    );
+    throw new Error("의도한 동기화 실패");
+  };
+  const app = await createLongviewApp(config, {
+    storeOptions: { refreshIntervalMs: 0 },
+    syncRunner
+  });
+  const address = await app.listen();
+  const baseUrl = "http://127.0.0.1:" + address.port;
+  t.after(async () => {
+    await app.close();
+    await rm(directory, { recursive: true, force: true });
+  });
+
+  const overviewResponse = await fetch(baseUrl + "/api/overview");
+  assert.equal(overviewResponse.status, 200);
+  assert.match(overviewResponse.headers.get("cache-control"), /max-age=60/);
+  assert.equal(overviewResponse.headers.get("x-frame-options"), "DENY");
+  const etag = overviewResponse.headers.get("etag");
+  const overview = await overviewResponse.json();
+  assert.equal(overview.summary.companies, 3);
+  assert.equal("errors" in overview.meta.sync, false);
+
+  const notModified = await fetch(baseUrl + "/api/overview", {
+    headers: { "If-None-Match": etag }
+  });
+  assert.equal(notModified.status, 304);
+
+  const listResponse = await fetch(
+    baseUrl + "/api/companies?country=KR&sort=name&page=2&pageSize=1"
+  );
+  assert.equal(listResponse.status, 200);
+  const list = await listResponse.json();
+  assert.equal(list.pagination.total, 2);
+  assert.equal(list.items.length, 1);
+  assert.equal(list.items[0].position, 2);
+  assert.equal("disclosures" in list.items[0], false);
+
+  const detailResponse = await fetch(baseUrl + "/api/companies/" + encodeURIComponent("US-TEST"));
+  assert.equal(detailResponse.status, 200);
+  const detail = await detailResponse.json();
+  assert.equal(detail.id, "US-TEST");
+  assert.equal(detail.disclosures.length, 1);
+  assert.equal((await fetch(baseUrl + "/api/companies/US-MISSING")).status, 404);
+  assert.equal((await fetch(baseUrl + "/api/companies?pageSize=101")).status, 400);
+
+  companies = [...companies, company(6)];
+  await writeFile(
+    dataFile,
+    JSON.stringify(snapshot(companies, "2026-07-18T00:00:00.000Z")),
+    "utf8"
+  );
+  const refreshed = await (await fetch(baseUrl + "/api/overview")).json();
+  assert.equal(refreshed.summary.companies, 4);
+  assert.notEqual(refreshed.revision, overview.revision);
+
+  const failedSync = await fetch(baseUrl + "/api/sync", {
+    method: "POST",
+    headers: { Authorization: "Bearer test-token" }
+  });
+  assert.equal(failedSync.status, 502);
+  const afterFailedSync = await (await fetch(baseUrl + "/api/overview")).json();
+  assert.equal(afterFailedSync.summary.companies, 6);
+
+  const health = await (await fetch(baseUrl + "/api/health")).json();
+  assert.equal(health.status, "ok");
+  assert.equal(health.companies, 6);
+  assert.equal(health.dataLoadStatus, "ok");
+});

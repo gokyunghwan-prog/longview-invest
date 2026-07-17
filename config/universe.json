@@ -1,0 +1,90 @@
+{
+  "description": "레거시 소수종목 설정입니다. 전체시장 v2 수집기는 이 목록을 사용하지 않습니다.",
+  "companies": [
+    {
+      "country": "KR",
+      "ticker": "005930",
+      "name": "삼성전자",
+      "exchange": "KOSPI",
+      "sector": "정보기술",
+      "enabled": true
+    },
+    {
+      "country": "KR",
+      "ticker": "000660",
+      "name": "SK하이닉스",
+      "exchange": "KOSPI",
+      "sector": "정보기술",
+      "enabled": true
+    },
+    {
+      "country": "KR",
+      "ticker": "005380",
+      "name": "현대자동차",
+      "exchange": "KOSPI",
+      "sector": "경기소비재",
+      "enabled": true
+    },
+    {
+      "country": "KR",
+      "ticker": "035420",
+      "name": "NAVER",
+      "exchange": "KOSPI",
+      "sector": "커뮤니케이션",
+      "enabled": true
+    },
+    {
+      "country": "KR",
+      "ticker": "051910",
+      "name": "LG화학",
+      "exchange": "KOSPI",
+      "sector": "소재",
+      "enabled": true
+    },
+    {
+      "country": "US",
+      "ticker": "AAPL",
+      "cik": "0000320193",
+      "name": "Apple",
+      "exchange": "NASDAQ",
+      "sector": "정보기술",
+      "enabled": true
+    },
+    {
+      "country": "US",
+      "ticker": "MSFT",
+      "cik": "0000789019",
+      "name": "Microsoft",
+      "exchange": "NASDAQ",
+      "sector": "정보기술",
+      "enabled": true
+    },
+    {
+      "country": "US",
+      "ticker": "GOOGL",
+      "cik": "0001652044",
+      "name": "Alphabet",
+      "exchange": "NASDAQ",
+      "sector": "커뮤니케이션",
+      "enabled": true
+    },
+    {
+      "country": "US",
+      "ticker": "NVDA",
+      "cik": "0001045810",
+      "name": "NVIDIA",
+      "exchange": "NASDAQ",
+      "sector": "정보기술",
+      "enabled": true
+    },
+    {
+      "country": "US",
+      "ticker": "COST",
+      "cik": "0000909832",
+      "name": "Costco",
+      "exchange": "NASDAQ",
+      "sector": "필수소비재",
+      "enabled": true
+    }
+  ]
+}
