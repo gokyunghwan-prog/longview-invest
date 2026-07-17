@@ -10,6 +10,7 @@ import {
   defaultDartAnnualBusinessYear,
   defaultDartFinancialPeriods,
   deriveDartMarketMetrics,
+  getDartMarketApiLimits,
   hasDartCoreFinancials,
   mergeDartDisclosures,
   normalizeDartFinancialIndices,
@@ -145,6 +146,9 @@ test("다중회사 요청은 공식 최대치인 100개 이하로 분할한다",
   const chunks = chunkDartCompanies(companies);
   assert.deepEqual(chunks.map((chunk) => chunk.length), [100, 100, 5]);
   assert.throws(() => chunkDartCompanies(companies, 101), RangeError);
+  assert.equal(getDartMarketApiLimits().maximumCompaniesPerBatch, 100);
+  assert.equal(getDartMarketApiLimits().defaultFinancialBatchSize, 50);
+  assert.equal(getDartMarketApiLimits().defaultFinancialTimeoutMs, 60_000);
 });
 
 test("주요계정은 연결재무제표를 우선하고 사업보고서 3개년 금액을 보존한다", () => {
@@ -463,6 +467,9 @@ test("같은 실행 ID로 재시작하면 DART 목록 지연에도 저장된 체
     assert.equal(requestOptions?.retries, 0);
     apiCalls += 1;
     const endpoint = new URL(url).pathname.split("/").at(-1);
+    if (["fnlttMultiAcnt.json", "fnlttCmpnyIndx.json"].includes(endpoint)) {
+      assert.equal(requestOptions?.timeoutMs, 60_000);
+    }
     const parameters = new URL(url).searchParams;
     if (endpoint === "company.json") {
       companyCalls += 1;
