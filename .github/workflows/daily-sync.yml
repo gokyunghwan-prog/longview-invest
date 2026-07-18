@@ -16,8 +16,8 @@ permissions:
 jobs:
   sync:
     runs-on: ubuntu-latest
-    # 첫 전체시장 재무 갱신이 약 173분 소요되어 일시적인 API 지연 여유를 둡니다.
-    timeout-minutes: 300
+    # 첫 전체시장 재무·DART 현금흐름 보강과 일시적인 API 지연 여유를 둡니다.
+    timeout-minutes: 360
 
     steps:
       - name: Check out repository
@@ -59,6 +59,11 @@ jobs:
         env:
           DART_API_KEY: ${{ secrets.DART_API_KEY }}
           SEC_USER_AGENT: ${{ secrets.SEC_USER_AGENT }}
+          DATA_GO_KR_API_KEY: ${{ secrets.DATA_GO_KR_API_KEY }}
+          US_LICENSED_PRICE_SNAPSHOT_URL: ${{ secrets.US_LICENSED_PRICE_SNAPSHOT_URL }}
+          US_LICENSED_PRICE_SNAPSHOT_TOKEN: ${{ secrets.US_LICENSED_PRICE_SNAPSHOT_TOKEN }}
+          US_LICENSED_PRICE_ALLOWED_HOSTS: ${{ secrets.US_LICENSED_PRICE_ALLOWED_HOSTS }}
+          ALLOW_PRICE_PROVIDER_FAILURE: "true"
           PYTHON: python
 
       - name: Validate generated snapshot
@@ -87,6 +92,7 @@ jobs:
           path: |
             data/sync-diagnostics.json
             data/us-sync-diagnostics.json
+            data/price-sync-diagnostics.json
           if-no-files-found: ignore
           retention-days: 14
 
@@ -102,6 +108,10 @@ jobs:
           git add data/companies.json
           git commit -m "data: daily full-market snapshot"
           git push
+
+      - name: Report configured price-provider failures
+        if: steps.market_sync.outcome == 'success' && steps.snapshot_validation.outcome == 'success'
+        run: npm run verify:prices
 
       - name: Fail when a market collector failed
         if: steps.market_sync.outcome == 'failure'

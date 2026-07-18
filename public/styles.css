@@ -891,6 +891,45 @@ main {
   letter-spacing: 0.04em;
 }
 
+.company-market-line {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 7px 10px;
+  align-items: center;
+}
+
+.company-price {
+  padding: 3px 6px;
+  color: #34463d;
+  background: #e7ede4;
+  border-radius: 3px;
+  font: 700 9px ui-monospace, monospace;
+  letter-spacing: -0.02em;
+  white-space: nowrap;
+}
+
+.company-price.up {
+  color: #bb453a;
+  background: #f8e8e4;
+}
+
+.company-price.down {
+  color: #3565a4;
+  background: #e6edf8;
+}
+
+.company-price.stale {
+  color: #7c6f54;
+  background: #f1ead9;
+  box-shadow: inset 0 0 0 1px rgba(124, 111, 84, 0.18);
+}
+
+.company-price.missing {
+  color: #909d96;
+  background: #eef0eb;
+  font-weight: 600;
+}
+
 .reason-block {
   margin-top: auto;
   padding-top: 20px;
@@ -1417,6 +1456,9 @@ dialog::backdrop {
 }
 
 .detail-total {
+  display: inline-flex;
+  gap: 8px;
+  align-items: baseline;
   color: var(--lime);
   font-size: 58px;
   font-weight: 850;
@@ -1425,7 +1467,28 @@ dialog::backdrop {
 }
 
 .detail-total small {
+  display: inline-block;
+  margin-left: 0;
   font-size: 14px;
+  font-weight: 700;
+  letter-spacing: 0;
+  line-height: 1;
+  white-space: nowrap;
+}
+
+.market-data-note {
+  margin: 12px 0 0;
+  color: #7c8a83;
+  font-size: 9px;
+  line-height: 1.6;
+}
+
+.market-data-note a {
+  margin-left: 8px;
+  color: #506c5d;
+  font-weight: 750;
+  text-decoration: underline;
+  text-underline-offset: 2px;
 }
 
 .detail-status {

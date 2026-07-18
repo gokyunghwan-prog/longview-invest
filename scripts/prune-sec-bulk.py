@@ -14,6 +14,7 @@ from zipfile import BadZipFile, ZipFile
 
 
 ANNUAL_FORMS = {"10-K", "10-K/A", "20-F", "20-F/A", "40-F", "40-F/A"}
+PERIODIC_FORMS = ANNUAL_FORMS | {"10-Q", "10-Q/A"}
 RELEVANT_FORMS = ANNUAL_FORMS | {
     "10-Q",
     "10-Q/A",
@@ -39,13 +40,21 @@ FACT_TAGS = {
         "AssetsCurrent",
         "LiabilitiesCurrent",
         "NetCashProvidedByUsedInOperatingActivities",
+        "NetCashProvidedByUsedInOperatingActivitiesContinuingOperations",
         "PaymentsToAcquirePropertyPlantAndEquipment",
         "PaymentsForAdditionsToPropertyPlantAndEquipment",
+        "PaymentsToAcquireProductiveAssets",
+        "EarningsPerShareBasic",
+        "EarningsPerShareDiluted",
+        "WeightedAverageNumberOfSharesOutstandingBasic",
+        "WeightedAverageNumberOfDilutedSharesOutstanding",
+        "CommonStockSharesOutstanding",
     },
     "ifrs-full": {
         "Revenue",
         "RevenueFromContractsWithCustomers",
         "OperatingProfitLoss",
+        "ProfitLossFromOperatingActivities",
         "ProfitLoss",
         "Assets",
         "Liabilities",
@@ -53,8 +62,21 @@ FACT_TAGS = {
         "CurrentAssets",
         "CurrentLiabilities",
         "CashFlowsFromUsedInOperatingActivities",
+        "CashFlowsFromUsedInOperatingActivitiesContinuingOperations",
         "PurchaseOfPropertyPlantAndEquipment",
+        "PurchaseOfPropertyPlantAndEquipmentClassifiedAsInvestingActivities",
+        "PurchaseOfPropertyPlantAndEquipmentIntangibleAssetsOtherThanGoodwillInvestmentPropertyAndOtherNoncurrentAssets",
+        "BasicEarningsLossPerShare",
+        "DilutedEarningsLossPerShare",
+        "WeightedAverageShares",
+        "AdjustedWeightedAverageShares",
     },
+    "dei": {"EntityCommonStockSharesOutstanding"},
+}
+
+PERIODIC_SHARE_TAGS = {
+    "CommonStockSharesOutstanding",
+    "EntityCommonStockSharesOutstanding",
 }
 
 SUBMISSION_FIELDS = {
@@ -151,11 +173,14 @@ def prune_facts(payload: dict[str, Any], facts_per_unit: int = 24) -> dict[str, 
             for unit, source_facts in source_units.items():
                 if not isinstance(source_facts, list):
                     continue
+                allowed_forms = (
+                    PERIODIC_FORMS if tag in PERIODIC_SHARE_TAGS else ANNUAL_FORMS
+                )
                 annual = [
                     fact
                     for fact in source_facts
                     if isinstance(fact, dict)
-                    and fact.get("form") in ANNUAL_FORMS
+                    and fact.get("form") in allowed_forms
                     and fact.get("end")
                     and isinstance(fact.get("val"), (int, float))
                 ]

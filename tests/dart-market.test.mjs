@@ -10,10 +10,12 @@ import {
   defaultDartAnnualBusinessYear,
   defaultDartFinancialPeriods,
   deriveDartMarketMetrics,
+  evaluateDartCashFlowCompatibility,
   getDartMarketApiLimits,
   hasDartCoreFinancials,
   mergeDartDisclosures,
   normalizeDartFinancialIndices,
+  normalizeDartCashFlowStatement,
   normalizeDartMainAccounts,
   parseDartNumber,
   planDartUniverseRefresh,
@@ -27,6 +29,86 @@ test("DART 숫자는 쉼표·괄호 음수를 정규화하고 비수치 표시�
   assert.equal(parseDartNumber("#########"), null);
   assert.equal(parseDartNumber("-"), null);
   assert.equal(parseDartNumber(null), null);
+});
+
+test("DART 연간 현금흐름은 exact XBRL ID를 우선하고 결측 CAPEX를 0으로 만들지 않는다", () => {
+  const rows = [
+    {
+      corp_code: "00126380",
+      fs_div: "CFS",
+      sj_div: "CF",
+      account_id: "custom_wrong",
+      account_nm: "영업활동 현금흐름",
+      thstrm_amount: "999",
+      bsns_year: "2025",
+      reprt_code: "11011"
+    },
+    {
+      corp_code: "00126380",
+      fs_div: "CFS",
+      sj_div: "CF",
+      account_id: "ifrs-full_CashFlowsFromUsedInOperatingActivities",
+      account_nm: "영업활동으로 인한 현금흐름",
+      thstrm_amount: "(120)",
+      bsns_year: "2025",
+      reprt_code: "11011",
+      rcept_no: "20260301000001"
+    }
+  ];
+  const cashFlow = normalizeDartCashFlowStatement(rows, {
+    corpCode: "00126380",
+    statementBasis: "CFS",
+    businessYear: "2025"
+  });
+  assert.equal(cashFlow.accounts.operatingCashFlow.value, -120);
+  assert.equal(cashFlow.accounts.capex, null);
+
+  const annualAccounts = {
+    statementBasis: "CFS",
+    businessYear: "2025",
+    reportCode: "11011",
+    currency: "KRW",
+    filingId: "20260301000001",
+    accounts: {
+      revenue: { current: 1000, previous: 900, twoYearsAgo: 800 },
+      netIncome: { current: 100, previous: 90, twoYearsAgo: 80 }
+    }
+  };
+  const annualPeriod = { businessYear: "2025", reportCode: "11011" };
+  const metrics = deriveDartMarketMetrics(
+    annualAccounts,
+    {},
+    annualAccounts,
+    cashFlow,
+    annualPeriod
+  );
+  assert.equal(metrics.fcfMargin, null);
+  assert.equal(metrics.cashConversion, -120);
+
+  const quarterlyPeriod = { businessYear: "2026", reportCode: "11013" };
+  assert.equal(
+    evaluateDartCashFlowCompatibility(annualAccounts, quarterlyPeriod, cashFlow)
+      .compatible,
+    false
+  );
+  assert.equal(
+    deriveDartMarketMetrics(
+      annualAccounts,
+      {},
+      annualAccounts,
+      cashFlow,
+      quarterlyPeriod
+    ).cashConversion,
+    null
+  );
+  assert.equal(
+    evaluateDartCashFlowCompatibility(
+      { ...annualAccounts, statementBasis: "OFS" },
+      annualPeriod,
+      cashFlow
+    ).compatible,
+    false
+  );
 });
 
 test("사업보고서 기본연도는 1~3월에 아직 제출되지 않은 직전 연도를 선택하지 않는다", () => {
@@ -825,6 +907,162 @@ test("기업개황이 하나라도 미확정이면 불완전한 전체시장 파
     await assert.rejects(readFile(path.join(temporary, "companies.json"), "utf8"), {
       code: "ENOENT"
     });
+  } finally {
+    await rm(temporary, { recursive: true, force: true });
+  }
+});
+
+test("DART 연간 현금흐름은 체크포인트를 재사용해 FCF를 같은 연도에서 계산한다", async () => {
+  const temporary = await mkdtemp(path.join(tmpdir(), "longview-dart-cashflow-"));
+  let cashFlowCalls = 0;
+  let annualFilingId = "20260301000001";
+  let operatingCashFlowAmount = 30;
+  const fetchCorpCodes = async () => [
+    {
+      corpCode: "00000001",
+      stockCode: "000001",
+      name: "현금회사",
+      modifiedAt: "20260701"
+    }
+  ];
+  const fetchJsonImpl = async (url) => {
+    const parsed = new URL(url);
+    const endpoint = parsed.pathname.split("/").at(-1);
+    if (endpoint === "company.json") {
+      return {
+        status: "000",
+        corp_name: "현금회사",
+        stock_name: "현금회사",
+        stock_code: "000001",
+        corp_cls: "Y",
+        induty_code: "100000",
+        acc_mt: "12"
+      };
+    }
+    if (endpoint === "list.json" || endpoint === "fnlttCmpnyIndx.json") {
+      return { status: "013", message: "No data" };
+    }
+    if (endpoint === "fnlttMultiAcnt.json") {
+      return {
+        status: "000",
+        list: [
+          {
+            stock_code: "000001",
+            corp_code: "00000001",
+            fs_div: "CFS",
+            sj_div: "IS",
+            account_nm: "매출액",
+            thstrm_amount: "100",
+            frmtrm_amount: "90",
+            bfefrmtrm_amount: "80",
+            reprt_code: "11011",
+            bsns_year: "2025",
+            currency: "KRW",
+            rcept_no: annualFilingId
+          },
+          {
+            stock_code: "000001",
+            corp_code: "00000001",
+            fs_div: "CFS",
+            sj_div: "IS",
+            account_nm: "당기순이익(손실)",
+            thstrm_amount: "10",
+            frmtrm_amount: "9",
+            bfefrmtrm_amount: "8",
+            reprt_code: "11011",
+            bsns_year: "2025",
+            currency: "KRW",
+            rcept_no: annualFilingId
+          }
+        ]
+      };
+    }
+    if (endpoint === "fnlttSinglAcntAll.json") {
+      cashFlowCalls += 1;
+      assert.equal(parsed.searchParams.get("fs_div"), "CFS");
+      return {
+        status: "000",
+        list: [
+          {
+            corp_code: "00000001",
+            fs_div: "CFS",
+            sj_div: "CF",
+            account_id: "ifrs-full_CashFlowsFromUsedInOperatingActivities",
+            account_nm: "영업활동현금흐름",
+            thstrm_amount: String(operatingCashFlowAmount),
+            reprt_code: "11011",
+            bsns_year: "2025",
+            currency: "KRW",
+            rcept_no: annualFilingId
+          },
+          {
+            corp_code: "00000001",
+            fs_div: "CFS",
+            sj_div: "CF",
+            account_id: "ifrs-full_PurchaseOfPropertyPlantAndEquipmentClassifiedAsInvestingActivities",
+            account_nm: "유형자산의 취득",
+            thstrm_amount: "5",
+            reprt_code: "11011",
+            bsns_year: "2025",
+            currency: "KRW",
+            rcept_no: annualFilingId
+          }
+        ]
+      };
+    }
+    throw new Error("Unexpected endpoint: " + endpoint);
+  };
+
+  try {
+    const baseOptions = {
+      dataDir: temporary,
+      now: new Date("2026-07-17T00:00:00.000Z"),
+      businessYear: "2025",
+      reportCode: "11011",
+      disclosureLookbackDays: 1,
+      minIntervalMs: 0,
+      maxRequests: 100,
+      minimumUniverseCount: 1,
+      minimumKospiCount: 1,
+      minimumKosdaqCount: 0,
+      enableCashFlowEnrichment: true,
+      fetchCorpCodes,
+      fetchJsonImpl
+    };
+    const first = await syncDartMarket(
+      { dartApiKey: "x".repeat(40) },
+      { ...baseOptions, runId: "cashflow-first" }
+    );
+    const second = await syncDartMarket(
+      { dartApiKey: "x".repeat(40) },
+      { ...baseOptions, runId: "cashflow-second" }
+    );
+    assert.equal(first.companies[0].metrics.fcfMargin, 25);
+    assert.equal(first.companies[0].metrics.cashConversion, 300);
+    assert.equal(first.companies[0].financials.latest.freeCashFlow, 25);
+    assert.equal(second.companies[0].metrics.fcfMargin, 25);
+    assert.equal(cashFlowCalls, 1);
+    const cashFlowCacheFile = path.join(temporary, "cashflows-2025-11011.json");
+    const cache = JSON.parse(await readFile(cashFlowCacheFile, "utf8"));
+    cache.recordsByCorpCode["00000001"] = null;
+    await writeFile(cashFlowCacheFile, JSON.stringify(cache), "utf8");
+
+    operatingCashFlowAmount = 40;
+    const retriedNull = await syncDartMarket(
+      { dartApiKey: "x".repeat(40) },
+      { ...baseOptions, runId: "cashflow-null-retry" }
+    );
+    assert.equal(cashFlowCalls, 2);
+    assert.equal(retriedNull.companies[0].financials.latest.freeCashFlow, 35);
+
+    annualFilingId = "20260302000002";
+    operatingCashFlowAmount = 50;
+    const refreshedFiling = await syncDartMarket(
+      { dartApiKey: "x".repeat(40) },
+      { ...baseOptions, runId: "cashflow-amended-filing" }
+    );
+    assert.equal(cashFlowCalls, 3);
+    assert.equal(refreshedFiling.companies[0].financials.latest.freeCashFlow, 45);
   } finally {
     await rm(temporary, { recursive: true, force: true });
   }
