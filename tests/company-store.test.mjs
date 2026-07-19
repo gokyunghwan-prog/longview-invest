@@ -10,6 +10,10 @@ import {
 } from "../lib/company-store.mjs";
 
 const UPDATED_AT = "2026-07-17T00:00:00.000Z";
+const STORE_OPTIONS = {
+  refreshIntervalMs: 0,
+  now: () => Date.parse("2026-07-19T00:00:00.000Z")
+};
 
 function strongMetrics() {
   return {
@@ -45,6 +49,26 @@ function weakMetrics() {
   };
 }
 
+function currentMarketData(valuation = {}) {
+  return {
+    status: "ok",
+    freshness: "current",
+    usageMode: "official_disclosure_derived",
+    currency: "KRW",
+    asOf: "2026-07-16",
+    price: 10_000,
+    marketCap: 1_000_000,
+    valuation: {
+      per: 8,
+      pbr: 0.7,
+      psr: 0.5,
+      fcfYield: 10,
+      issues: [],
+      ...valuation
+    }
+  };
+}
+
 function company(index, overrides = {}) {
   const ticker = String(index).padStart(6, "0");
   return {
@@ -61,6 +85,7 @@ function company(index, overrides = {}) {
     statementBasis: "K-IFRS · 연결재무제표",
     dataMode: "live",
     metrics: strongMetrics(),
+    marketData: currentMarketData(),
     history: [
       { label: "2023", revenue: 100, operatingIncome: 20 },
       { label: "2024", revenue: 120, operatingIncome: 24 },
@@ -156,7 +181,7 @@ test("목록은 서버 필터·안정 정렬·페이지네이션을 적용하고
   ];
   const temporary = await temporaryDataset(companies);
   t.after(() => rm(temporary.directory, { recursive: true, force: true }));
-  const store = await createCompanyStore(temporary.file, { refreshIntervalMs: 0 });
+  const store = await createCompanyStore(temporary.file, STORE_OPTIONS);
 
   const overview = store.getOverview();
   assert.equal(overview.summary.companies, 4);
@@ -172,6 +197,29 @@ test("목록은 서버 필터·안정 정렬·페이지네이션을 적용하고
   assert.equal("disclosures" in firstPage.items[0], false);
   assert.equal("lineage" in firstPage.items[0], false);
   assert.equal(firstPage.items[0].reasons.length, 1);
+  assert.equal(firstPage.items[0].score.modelVersion, "2.0.0");
+  assert.equal(firstPage.items[0].score.evaluationReady, true);
+  assert.deepEqual(Object.keys(firstPage.items[0].score.components), [
+    "valuation",
+    "longGrowth",
+    "quality",
+    "safety"
+  ]);
+  assert.deepEqual(
+    Object.fromEntries(
+      Object.entries(firstPage.items[0].score.components).map(([key, component]) => [
+        key,
+        component.weight
+      ])
+    ),
+    { valuation: 30, longGrowth: 35, quality: 20, safety: 15 }
+  );
+  assert.deepEqual(firstPage.items[0].marketData.valuation, {
+    per: 8,
+    pbr: 0.7,
+    psr: 0.5,
+    fcfYield: 10
+  });
 
   const filtered = store.list(
     query("q=%EF%BC%A1%EF%BC%AC%EF%BC%B0%EF%BC%A8%EF%BC%A1&country=US&sector=정보기술")
@@ -196,7 +244,7 @@ test("목록은 서버 필터·안정 정렬·페이지네이션을 적용하고
 test("외부 파일 교체를 감지하고 잘못된 새 파일에서는 마지막 정상 스냅샷을 유지한다", async (t) => {
   const temporary = await temporaryDataset([company(1)]);
   t.after(() => rm(temporary.directory, { recursive: true, force: true }));
-  const store = await createCompanyStore(temporary.file, { refreshIntervalMs: 0 });
+  const store = await createCompanyStore(temporary.file, STORE_OPTIONS);
   const firstRevision = store.getOverview().revision;
 
   await writeFile(
@@ -226,15 +274,31 @@ test("평가 보류와 데이터 부족 기업은 점수가 높아도 평가 가
   const temporary = await temporaryDataset([
     held,
     insufficient,
-    company(1, { metrics: weakMetrics() })
+    company(1)
   ]);
   t.after(() => rm(temporary.directory, { recursive: true, force: true }));
-  const store = await createCompanyStore(temporary.file, { refreshIntervalMs: 0 });
+  const store = await createCompanyStore(temporary.file, STORE_OPTIONS);
 
   const result = store.list(query("sort=score&pageSize=100"));
   assert.equal(result.items[0].id, "KR-000001");
+  assert.equal(result.items[0].score.candidate.eligible, true);
   assert.equal(result.items.at(-1).id, "KR-000002");
   assert.equal(result.items.at(-1).analysisStatus, "not_applicable");
+});
+
+test("날짜가 바뀌면 같은 파일도 다시 평가해 10일 지난 시세를 보류한다", async (t) => {
+  const temporary = await temporaryDataset([company(1)]);
+  t.after(() => rm(temporary.directory, { recursive: true, force: true }));
+  let currentTime = Date.parse("2026-07-19T00:00:00.000Z");
+  const store = await createCompanyStore(temporary.file, {
+    refreshIntervalMs: 0,
+    now: () => currentTime
+  });
+
+  assert.equal(store.getCompany("KR-000001").score.evaluationReady, true);
+  currentTime = Date.parse("2026-07-30T00:00:00.000Z");
+  assert.equal(await store.refreshIfChanged(), true);
+  assert.equal(store.getCompany("KR-000001").score.evaluationReady, false);
 });
 
 test("10,000개 데이터도 한 페이지의 경량 응답만 반환한다", async (t) => {
@@ -246,7 +310,7 @@ test("10,000개 데이터도 한 페이지의 경량 응답만 반환한다", as
   );
   const temporary = await temporaryDataset(companies);
   t.after(() => rm(temporary.directory, { recursive: true, force: true }));
-  const store = await createCompanyStore(temporary.file, { refreshIntervalMs: 0 });
+  const store = await createCompanyStore(temporary.file, STORE_OPTIONS);
   const result = store.list(query("country=US&page=50&pageSize=50"));
 
   assert.equal(result.pagination.total, 5_000);

@@ -7,6 +7,26 @@ import { createLongviewApp } from "../server.mjs";
 
 const UPDATED_AT = "2026-07-17T00:00:00.000Z";
 
+function currentMarketData(valuation = {}) {
+  return {
+    status: "ok",
+    freshness: "current",
+    usageMode: "official_disclosure_derived",
+    currency: "KRW",
+    asOf: "2026-07-16",
+    price: 10_000,
+    marketCap: 1_000_000,
+    valuation: {
+      per: 8,
+      pbr: 0.7,
+      psr: 0.5,
+      fcfYield: 10,
+      issues: [],
+      ...valuation
+    }
+  };
+}
+
 function company(index, overrides = {}) {
   const ticker = String(index).padStart(6, "0");
   return {
@@ -20,6 +40,7 @@ function company(index, overrides = {}) {
     period: "2025 사업연도",
     statementBasis: "K-IFRS · 연결재무제표",
     dataMode: "live",
+    marketData: currentMarketData(),
     metrics: {
       roe: 25,
       operatingMargin: 25,
@@ -107,7 +128,10 @@ test("overview, paginated list, detail, ETag와 reload가 함께 동작한다", 
     throw new Error("의도한 동기화 실패");
   };
   const app = await createLongviewApp(config, {
-    storeOptions: { refreshIntervalMs: 0 },
+    storeOptions: {
+      refreshIntervalMs: 0,
+      now: () => Date.parse("2026-07-19T00:00:00.000Z")
+    },
     syncRunner
   });
   const address = await app.listen();
@@ -130,6 +154,28 @@ test("overview, paginated list, detail, ETag와 reload가 함께 동작한다", 
     headers: { "If-None-Match": etag }
   });
   assert.equal(notModified.status, 304);
+
+  const methodologyResponse = await fetch(baseUrl + "/api/methodology");
+  assert.equal(methodologyResponse.status, 200);
+  const methodology = await methodologyResponse.json();
+  assert.equal(methodology.modelVersion, "2.0.0");
+  assert.equal(methodology.valuationIncluded, true);
+  assert.equal(methodology.valuationDisplayed, true);
+  assert.equal(methodology.candidateRules.minimumTotal, 75);
+  assert.equal(methodology.candidateRules.componentMinimums.valuation, 60);
+  assert.deepEqual(methodology.rankingOrder.slice(0, 2), [
+    "candidateEligibility",
+    "evaluationReadiness"
+  ]);
+  assert.deepEqual(
+    methodology.groups.map(({ key, weight }) => ({ key, weight })),
+    [
+      { key: "valuation", weight: 30 },
+      { key: "longGrowth", weight: 35 },
+      { key: "quality", weight: 20 },
+      { key: "safety", weight: 15 }
+    ]
+  );
 
   const listResponse = await fetch(
     baseUrl + "/api/companies?country=KR&sort=name&page=2&pageSize=1"
@@ -206,7 +252,10 @@ test("원격 모드는 추적 파일을 건드리지 않고 runtime snapshot으�
     syncToken: ""
   };
   const app = await createLongviewApp(config, {
-    storeOptions: { refreshIntervalMs: 0 },
+    storeOptions: {
+      refreshIntervalMs: 0,
+      now: () => Date.parse("2026-07-19T00:00:00.000Z")
+    },
     runtimeSnapshotPreparer: async () => ({
       dataFile: runtimeDataFile,
       source: "local",

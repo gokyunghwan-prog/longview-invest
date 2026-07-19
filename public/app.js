@@ -49,6 +49,18 @@ const elements = {
 };
 
 const METRIC_LABELS = {
+  per: "PER",
+  pbr: "PBR",
+  psr: "PSR",
+  fcfYield: "FCF 수익률",
+  relativePer: "산업 대비 PER",
+  relativePbr: "산업 대비 PBR",
+  relativePsr: "산업 대비 PSR",
+  sectorRelativePer: "산업 대비 PER",
+  sectorRelativePbr: "산업 대비 PBR",
+  sectorRelativePsr: "산업 대비 PSR",
+  revenueCagr: "매출 CAGR",
+  operatingMarginTrend: "영업이익률 추세",
   roe: "ROE",
   operatingMargin: "영업이익률",
   netMargin: "순이익률",
@@ -61,8 +73,7 @@ const METRIC_LABELS = {
   positiveIncomeYears: "흑자 연도",
   revenueStability: "매출 안정성",
   disclosureRecencyDays: "최근 공시 경과일",
-  amendmentCount: "정정 공시",
-  per: "PER"
+  amendmentCount: "정정 공시"
 };
 
 function escapeHtml(value) {
@@ -218,7 +229,11 @@ function evaluationStatus(company) {
 }
 
 function isEvaluationHeld(company) {
-  return evaluationStatus(company) === "not_applicable" || company.modelApplicability === false;
+  return (
+    company.score?.evaluationReady === false ||
+    evaluationStatus(company) === "not_applicable" ||
+    company.modelApplicability === false
+  );
 }
 
 function showToast(message) {
@@ -261,11 +276,20 @@ function renderSummary(summary = {}) {
   const candidates = summary.candidates ?? summary.candidateCompanies ?? 0;
   const averageScore = summary.averageScore ?? 0;
   const averageConfidence = summary.averageConfidence ?? 0;
+  const evaluationReadyCompanies = summary.evaluationReadyCompanies ?? 0;
 
   setText("#summary-companies", Number(count).toLocaleString("ko-KR"));
   setText("#summary-candidates", Number(candidates).toLocaleString("ko-KR"));
   setText("#summary-score", Math.round(Number(averageScore) || 0) + "점");
   setText("#summary-confidence", Math.round(Number(averageConfidence) || 0) + "%");
+  setText(
+    "#summary-score + span",
+    "평가가능 " + Number(evaluationReadyCompanies).toLocaleString("ko-KR") + "사 평균점수"
+  );
+  setText(
+    "#summary-confidence + span",
+    "평가가능 " + Number(evaluationReadyCompanies).toLocaleString("ko-KR") + "사 평균 신뢰도"
+  );
 }
 
 function populateSectors(facets = {}) {
@@ -282,10 +306,10 @@ function populateSectors(facets = {}) {
 }
 
 function componentBars(company) {
-  const keys = ["profitability", "growth", "safety", "cashflow"];
+  const keys = ["valuation", "longGrowth", "quality", "safety"];
   return keys
     .map((key) => {
-      const component = company.score.components[key];
+      const component = company.score?.components?.[key];
       const hasData =
         Number(component?.confidence || 0) > 0 && Number.isFinite(Number(component?.score));
       const score = hasData ? Number(component.score) : 0;
@@ -374,7 +398,9 @@ function companyCard(company, visibleRank) {
         ? '<span class="status-ribbon">DATA 부족</span>'
         : analysisStatus === "not_applicable" || company.modelApplicability === false
           ? '<span class="status-ribbon">평가 보류</span>'
-      : "";
+          : evaluationHeld
+            ? '<span class="status-ribbon">가치평가 보류</span>'
+            : "";
 
   return (
     '<article class="company-card" data-company="' +
@@ -416,7 +442,11 @@ function companyCard(company, visibleRank) {
     "<div><span>부채</span><strong>" +
     formatMetric(metrics.debtRatio) +
     "</strong></div>" +
-    '<div title="검증된 시세와 연차 공시로 계산한 참고값이며 총점에는 미포함"><span>PER</span><strong>' +
+    '<div title="' +
+    (evaluationHeld
+      ? "검증된 최신 가치지표가 부족해 가치 순위 평가를 보류합니다."
+      : "검증된 시세와 같은 기간의 연차 공시로 계산해 저평가 영역에 반영합니다.") +
+    '"><span>PER</span><strong>' +
     formatMetric(metrics.per, "multiple") +
     "</strong></div></div>" +
     '<div class="score-bars">' +
@@ -641,8 +671,13 @@ function detailMarketMetrics(company) {
 function marketDataNote(company) {
   const source = company.marketData?.source;
   if (!source?.name) {
-    return '<p class="market-data-note">검증된 시세 공급자가 연결되지 않아 N/A로 표시합니다.</p>';
+    return '<p class="market-data-note">검증된 시세 공급자가 연결되지 않아 N/A로 표시하며, 저평가 영역과 가치 순위 평가는 보류합니다.</p>';
   }
+  const valuation = company.marketData?.valuation || {};
+  const valuationScored =
+    Number(company.score?.components?.valuation?.confidence || 0) > 0 &&
+    [valuation.per, valuation.pbr, valuation.psr, valuation.fcfYield].some(isNumber);
+  const rankingReady = company.score?.evaluationReady === true;
   const freshness =
     company.marketData.freshness === "stale"
       ? "오래된 가격이므로 기준일 확인 필요"
@@ -656,14 +691,25 @@ function marketDataNote(company) {
     '<p class="market-data-note">출처: ' +
     escapeHtml(source.name) +
     " · " +
-    escapeHtml(freshness + " · 연차 공시 기준 가치평가·총점 미포함") +
+    escapeHtml(
+      freshness +
+        (rankingReady
+          ? " · 검증된 연차 공시 기준 가치지표를 저평가 영역과 총점에 반영"
+          : valuationScored
+            ? " · 일부 가치지표는 반영했지만 커버리지 부족으로 가치 순위 평가 보류"
+            : " · 가치지표 부족으로 저평가 영역과 가치 순위 평가 보류")
+    ) +
     sourceLink +
     "</p>"
   );
 }
 
 function detailComponents(company) {
-  return Object.values(company.score.components)
+  const components = company.score?.components || {};
+  const orderedComponents = ["valuation", "longGrowth", "quality", "safety"]
+    .map((key) => components[key])
+    .filter(Boolean);
+  return orderedComponents
     .map((component) => {
       const hasData =
         Number(component?.confidence || 0) > 0 && Number.isFinite(Number(component?.score));
