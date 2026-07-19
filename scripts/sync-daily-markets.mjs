@@ -2,6 +2,7 @@ import { getRuntimeConfig } from "../lib/config.mjs";
 import { mergeMarketDatasets } from "../lib/market-dataset.mjs";
 import { syncDartMarket } from "../lib/providers/dart-market.mjs";
 import { syncUsBulk } from "./sync-us-bulk.mjs";
+import { syncStockPrices } from "./sync-stock-prices.mjs";
 
 function safeMessage(error) {
   return (error instanceof Error ? error.message : String(error))
@@ -58,14 +59,36 @@ if (runs.US.attempted) {
   runs.US.error = "SEC_USER_AGENT가 설정되지 않았습니다.";
 }
 
+let mergeSucceeded = false;
 try {
   const dataset = await mergeMarketDatasets(config, { runs });
+  mergeSucceeded = true;
   console.log(
     `[MERGE] 한국 ${dataset.meta.coverage.kr}개 · 미국 ${dataset.meta.coverage.us}개 · ${dataset.meta.sync.status}`
   );
 } catch (error) {
   console.error("[MERGE] " + safeMessage(error));
   process.exitCode = 1;
+}
+
+if (mergeSucceeded) {
+  try {
+    const priceResult = await syncStockPrices(config, {
+      failOnConfiguredProviderError:
+        process.env.ALLOW_PRICE_PROVIDER_FAILURE !== "true",
+      onProgress: (message) => console.log("[PRICE] " + message)
+    });
+    const ok = priceResult.providers.filter((provider) =>
+      provider.status === "ok"
+    ).length;
+    console.log(`[PRICE] 시세 공급자 ${ok}/${priceResult.providers.length}개 갱신`);
+    if (priceResult.failures.length > 0) {
+      console.error(`[PRICE] 설정된 공급자 ${priceResult.failures.length}개 실패 · 진단 파일 확인`);
+    }
+  } catch (error) {
+    console.error("[PRICE] " + safeMessage(error));
+    process.exitCode = 1;
+  }
 }
 
 if (!runs.KR.success || !runs.US.success) process.exitCode = 1;

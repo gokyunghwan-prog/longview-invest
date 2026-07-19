@@ -514,6 +514,17 @@ export async function syncUsBulk(options = {}) {
       counts[status] = (counts[status] || 0) + 1;
       return counts;
     }, {});
+    const metricCoverage = Object.fromEntries(
+      [
+        ["fcfMargin", (company) => company.metrics?.fcfMargin],
+        ["cashConversion", (company) => company.metrics?.cashConversion],
+        ["eps", (company) => company.financials?.latest?.epsDiluted ?? company.financials?.latest?.epsBasic],
+        ["sharesOutstanding", (company) => company.financials?.latest?.sharesOutstanding]
+      ].map(([key, getter]) => [
+        key,
+        companies.filter((company) => Number.isFinite(getter(company))).length
+      ])
+    );
     const dataset = {
       meta: {
         schemaVersion: 1,
@@ -528,6 +539,7 @@ export async function syncUsBulk(options = {}) {
         sync: {
           status: "ok",
           statusCounts,
+          metricCoverage,
           pruned: {
             submissions: submissionsPrune,
             facts: factsPrune
@@ -561,6 +573,7 @@ export async function syncUsBulk(options = {}) {
       updatedAt: generatedAt,
       companyCount: companies.length,
       statusCounts,
+      metricCoverage,
       pruned: dataset.meta.sync.pruned
     });
     progress("SEC 미국 전체 동기화 완료: " + companies.length + "개 회사");

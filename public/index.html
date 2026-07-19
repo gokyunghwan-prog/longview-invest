@@ -220,8 +220,8 @@
             <span>02</span>
             <h3>모르는 값은 비워두기</h3>
             <p>
-              시세 공급원 없는 PER처럼 검증할 수 없는 값은 만들지 않습니다. 결측치는 중립
-              처리하고 데이터 완전성과 후보 자격을 낮춥니다.
+              시세가 연결되면 기준일·출처와 함께 PER을 계산하고, 없으면 만들지 않습니다.
+              결측치는 중립 처리하고 데이터 완전성과 후보 자격을 낮춥니다.
             </p>
           </article>
           <article>
@@ -252,6 +252,7 @@
         <button id="footer-methodology-button" type="button">산정 방법</button>
         <a href="https://opendart.fss.or.kr/" target="_blank" rel="noreferrer">DART ↗</a>
         <a href="https://www.sec.gov/edgar/search/" target="_blank" rel="noreferrer">EDGAR ↗</a>
+        <a href="https://www.data.go.kr/data/15094808/openapi.do" target="_blank" rel="noreferrer">한국 시세 ↗</a>
       </div>
     </footer>
 
@@ -279,11 +280,11 @@
         </div>
         <div class="method-groups" id="method-groups"></div>
         <div class="method-note">
-          <strong>가격 지표는 왜 빠져 있나요?</strong>
+          <strong>가격 지표는 점수에 어떻게 반영되나요?</strong>
           <p>
-            DART와 SEC는 현재 주가를 제공하지 않습니다. PER·PBR·FCF 수익률은 검증된 시세
-            공급원과 기준시각이 연결된 뒤 별도 밸류에이션 영역으로 추가합니다. 그 전에는
-            공시 수치만으로 가격 매력을 추정하지 않습니다.
+            PER·PBR·FCF 수익률은 검증된 시세와 같은 통화의 연차 공시가 있을 때 별도
+            가치평가 영역에 표시합니다. 기업 간 시세 커버리지가 동일하지 않으므로 현재
+            장기분석 총점에는 넣지 않으며, N/A를 0점으로 계산하지 않습니다.
           </p>
         </div>
       </div>

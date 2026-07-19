@@ -109,6 +109,56 @@ function plainMetric(value, type = "percent") {
   return formatted + "%";
 }
 
+function formatPrice(value, currency) {
+  if (!isNumber(value)) return "—";
+  try {
+    return new Intl.NumberFormat("ko-KR", {
+      style: "currency",
+      currency: currency || "USD",
+      currencyDisplay: "narrowSymbol",
+      maximumFractionDigits: currency === "KRW" ? 0 : 2
+    }).format(value);
+  } catch {
+    return new Intl.NumberFormat("ko-KR", { maximumFractionDigits: 2 }).format(value);
+  }
+}
+
+function formatMarketCap(value, currency) {
+  if (!isNumber(value)) return "—";
+  const formatted = new Intl.NumberFormat("ko-KR", {
+    notation: "compact",
+    maximumFractionDigits: 2
+  }).format(value);
+  return formatted + " " + String(currency || "");
+}
+
+function marketPriceChip(company) {
+  const marketData = company.marketData;
+  if (!marketData || !isNumber(marketData.price)) {
+    return '<span class="company-price missing" title="검증된 시세가 아직 연결되지 않았습니다">시세 N/A</span>';
+  }
+  const change = marketData.changePercent;
+  const changeClass = isNumber(change) ? (change > 0 ? "up" : change < 0 ? "down" : "flat") : "";
+  const changeText = isNumber(change) ? " " + (change > 0 ? "+" : "") + plainMetric(change) : "";
+  const delayed = marketData.status !== "ok" || marketData.freshness === "stale";
+  const statusText =
+    marketData.freshness === "stale" ? "오래된 시세" : delayed ? "마지막 보존 시세" : "최신 확인 시세";
+  return (
+    '<span class="company-price ' +
+    changeClass +
+    (delayed ? " stale" : "") +
+    '" title="' +
+    statusText +
+    " · 가격 기준일 " +
+    escapeHtml(marketData.asOf || "미상") +
+    '">' +
+    (delayed ? "지연 · " : "") +
+    escapeHtml(formatPrice(marketData.price, marketData.currency)) +
+    escapeHtml(changeText) +
+    "</span>"
+  );
+}
+
 function formatDate(value, includeTime = false) {
   if (!value) return "기준일 없음";
   const date = new Date(value);
@@ -345,11 +395,13 @@ function companyCard(company, visibleRank) {
     "<h3>" +
     escapeHtml(company.name) +
     "</h3>" +
-    '<span class="company-ticker">' +
+    '<div class="company-market-line"><span class="company-ticker">' +
     escapeHtml(company.ticker) +
     " · " +
     escapeHtml(company.period || "기간 미상") +
     "</span>" +
+    marketPriceChip(company) +
+    "</div>" +
     '<div class="reason-block"><span class="reason-label">' + reasonLabel + '</span><p>' +
     escapeHtml(reason) +
     "</p></div></div>" +
@@ -364,7 +416,7 @@ function companyCard(company, visibleRank) {
     "<div><span>부채</span><strong>" +
     formatMetric(metrics.debtRatio) +
     "</strong></div>" +
-    '<div title="공시기관은 현재 주가를 제공하지 않습니다"><span>PER</span><strong>' +
+    '<div title="검증된 시세와 연차 공시로 계산한 참고값이며 총점에는 미포함"><span>PER</span><strong>' +
     formatMetric(metrics.per, "multiple") +
     "</strong></div></div>" +
     '<div class="score-bars">' +
@@ -552,8 +604,7 @@ function detailMetrics(company) {
     ["부채비율", plainMetric(metrics.debtRatio)],
     ["유동비율", plainMetric(metrics.currentRatio)],
     ["FCF 마진", plainMetric(metrics.fcfMargin)],
-    ["현금 전환율", plainMetric(metrics.cashConversion)],
-    ["PER", plainMetric(metrics.per, "multiple")]
+    ["현금 전환율", plainMetric(metrics.cashConversion)]
   ];
   return items
     .map(
@@ -561,6 +612,54 @@ function detailMetrics(company) {
         "<div><span>" + escapeHtml(label) + "</span><strong>" + escapeHtml(value) + "</strong></div>"
     )
     .join("");
+}
+
+function detailMarketMetrics(company) {
+  const marketData = company.marketData || {};
+  const valuation = marketData.valuation || {};
+  const items = [
+    ["종가", formatPrice(marketData.price, marketData.currency)],
+    ["일 등락률", plainMetric(marketData.changePercent)],
+    [
+      marketData.marketCapScope === "security" ? "종목 시가총액" : "시가총액",
+      formatMarketCap(marketData.marketCap, marketData.currency)
+    ],
+    ["PER", plainMetric(valuation.per, "multiple")],
+    ["PBR", plainMetric(valuation.pbr, "multiple")],
+    ["PSR", plainMetric(valuation.psr, "multiple")],
+    ["FCF 수익률", plainMetric(valuation.fcfYield)],
+    ["가격 기준일", marketData.asOf || "—"]
+  ];
+  return items
+    .map(
+      ([label, value]) =>
+        "<div><span>" + escapeHtml(label) + "</span><strong>" + escapeHtml(value) + "</strong></div>"
+    )
+    .join("");
+}
+
+function marketDataNote(company) {
+  const source = company.marketData?.source;
+  if (!source?.name) {
+    return '<p class="market-data-note">검증된 시세 공급자가 연결되지 않아 N/A로 표시합니다.</p>';
+  }
+  const freshness =
+    company.marketData.freshness === "stale"
+      ? "오래된 가격이므로 기준일 확인 필요"
+      : company.marketData.status !== "ok"
+        ? "마지막 정상 가격 보존"
+        : "최신성 확인";
+  const sourceLink = source.url
+    ? '<a href="' + safeUrl(source.url) + '" target="_blank" rel="noreferrer">공급자 문서 ↗</a>'
+    : "";
+  return (
+    '<p class="market-data-note">출처: ' +
+    escapeHtml(source.name) +
+    " · " +
+    escapeHtml(freshness + " · 연차 공시 기준 가치평가·총점 미포함") +
+    sourceLink +
+    "</p>"
+  );
 }
 
 function detailComponents(company) {
@@ -621,7 +720,7 @@ function renderCompanyDetail(company) {
   const candidate = company.score.candidate;
   const evaluationHeld = isEvaluationHeld(company);
   const detailScore = evaluationHeld ? "—" : company.score.total;
-  const detailScoreSuffix = evaluationHeld ? "" : "<small> / 100</small>";
+  const detailScoreSuffix = evaluationHeld ? "" : "<small>/100</small>";
   const reasonHeading = evaluationHeld ? "평가 안내" : "모델이 높게 평가한 이유";
 
   elements.companyDialogContent.innerHTML =
@@ -664,6 +763,11 @@ function renderCompanyDetail(company) {
     '<section class="detail-section"><h3>핵심 재무지표</h3><div class="metric-table">' +
     detailMetrics(company) +
     "</div></section>" +
+    '<section class="detail-section"><h3>시세·연차 공시 기준 가치평가</h3><div class="metric-table">' +
+    detailMarketMetrics(company) +
+    "</div>" +
+    marketDataNote(company) +
+    "</section>" +
     '<section class="detail-section"><h3>최근 공시</h3>' +
     detailDisclosures(company) +
     "</section></div>" +
@@ -872,6 +976,7 @@ async function initialize() {
     populateSectors(state.overview.facets || {});
     renderCountryFacets(state.overview.facets || {});
     await loadCompanies();
+    startRevisionPolling();
   } catch (error) {
     elements.companyList.setAttribute("aria-busy", "false");
     elements.companyList.innerHTML =
@@ -880,6 +985,34 @@ async function initialize() {
       "</span></div>";
     showToast("데이터 연결을 확인해 주세요.");
   }
+}
+
+async function refreshOverviewIfChanged() {
+  if (document.hidden || state.listRequest) return;
+  try {
+    const response = await fetch("/api/overview", { cache: "no-cache" });
+    if (!response.ok) return;
+    const overview = await response.json();
+    if (!overview.revision || overview.revision === state.revision) return;
+    state.overview = overview;
+    state.revision = overview.revision;
+    state.detailCache.clear();
+    renderMeta(overview.meta || {});
+    renderSummary(overview.summary || {});
+    populateSectors(overview.facets || {});
+    renderCountryFacets(overview.facets || {});
+    await loadCompanies();
+    showToast("오늘의 공시·시세 데이터로 자동 갱신했습니다.");
+  } catch {
+    // The next poll retries; a transient polling failure must not replace the current screen.
+  }
+}
+
+function startRevisionPolling() {
+  window.setInterval(refreshOverviewIfChanged, 5 * 60 * 1_000);
+  document.addEventListener("visibilitychange", () => {
+    if (!document.hidden) refreshOverviewIfChanged();
+  });
 }
 
 initialize();

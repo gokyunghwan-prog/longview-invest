@@ -31,6 +31,14 @@ class PruneSecBulkTests(unittest.TestCase):
                 "filed": "2026-02-01",
             }
             fact_8k = {**fact_10k, "form": "8-K", "val": 999}
+            fact_10q = {
+                **fact_10k,
+                "end": "2026-03-31",
+                "form": "10-Q",
+                "fp": "Q1",
+                "val": 120,
+                "filed": "2026-05-01",
+            }
             payload = {
                 "cik": 123,
                 "entityName": "Target Corp",
@@ -39,12 +47,20 @@ class PruneSecBulkTests(unittest.TestCase):
                         "Revenues": {
                             "label": "Revenue",
                             "description": "Revenue",
-                            "units": {"USD": [fact_10k, fact_8k]},
+                            "units": {"USD": [fact_10k, fact_10q, fact_8k]},
+                        },
+                        "EarningsPerShareDiluted": {
+                            "units": {"USD/shares": [{**fact_10k, "val": 3.5}]},
                         },
                         "CustomExtension": {
                             "units": {"USD": [fact_10k]},
                         },
-                    }
+                    },
+                    "dei": {
+                        "EntityCommonStockSharesOutstanding": {
+                            "units": {"shares": [fact_10k, fact_10q]},
+                        }
+                    },
                 },
             }
             with ZipFile(archive, "w") as zipped:
@@ -65,9 +81,14 @@ class PruneSecBulkTests(unittest.TestCase):
             self.assertEqual(record["cik"], "0000000123")
             concepts = record["data"]["facts"]["us-gaap"]
             self.assertIn("Revenues", concepts)
+            self.assertIn("EarningsPerShareDiluted", concepts)
             self.assertNotIn("CustomExtension", concepts)
             kept_facts = concepts["Revenues"]["units"]["USD"]
             self.assertEqual([fact["form"] for fact in kept_facts], ["10-K"])
+            shares = record["data"]["facts"]["dei"][
+                "EntityCommonStockSharesOutstanding"
+            ]["units"]["shares"]
+            self.assertEqual([fact["form"] for fact in shares], ["10-K", "10-Q"])
             self.assertFalse((root / "CIK0000000123.json").exists())
 
     def test_submission_pruning_preserves_column_alignment_and_ignores_missing_cik(self):

@@ -11,9 +11,11 @@
     "sync:kr-market": "node scripts/sync-kr-market.mjs",
     "sync:us-market": "node scripts/sync-us-bulk.mjs",
     "sync:daily": "node scripts/sync-daily-markets.mjs",
+    "sync:prices": "node scripts/sync-stock-prices.mjs",
+    "verify:prices": "node scripts/verify-price-sync.mjs",
     "merge:markets": "node scripts/merge-market-data.mjs",
     "validate:snapshot": "node scripts/validate-snapshot.mjs",
-    "check": "node --check server.mjs && node --check public/app.js && node --check scripts/sync-daily-markets.mjs && node --check scripts/sync-us-bulk.mjs && node --check scripts/validate-snapshot.mjs && node --test"
+    "check": "node --check server.mjs && node --check public/app.js && node --check scripts/sync-daily-markets.mjs && node --check scripts/sync-stock-prices.mjs && node --check scripts/verify-price-sync.mjs && node --check scripts/sync-us-bulk.mjs && node --check scripts/validate-snapshot.mjs && node --test"
   },
   "engines": {
     "node": ">=20"

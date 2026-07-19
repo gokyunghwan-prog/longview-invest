@@ -225,7 +225,9 @@ export async function createLongviewApp(
           name: "공시 기반 장기분석 모델 v1",
           groups: getScoringModel(),
           valuationIncluded: false,
-          note: "PER 등 가격 지표는 검증된 시세 공급원이 연결되기 전까지 점수에 포함하지 않습니다."
+          valuationDisplayed: true,
+          note:
+            "검증된 시세와 같은 통화의 최신 연차 공시로 계산한 PER·PBR 등은 참고값이며 현재 총점에는 포함하지 않습니다."
         },
         {
           cacheControl: "public, max-age=86400",

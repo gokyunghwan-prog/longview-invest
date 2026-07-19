@@ -79,6 +79,24 @@ function healthyFacts() {
         ),
         PaymentsToAcquirePropertyPlantAndEquipment: concept(
           durationFacts(years.map((point) => ({ ...point, value: point.value / 30 })))
+        ),
+        EarningsPerShareBasic: concept(
+          durationFacts(years.map((point) => ({ ...point, value: point.value / 10 }))),
+          "USD/shares"
+        ),
+        EarningsPerShareDiluted: concept(
+          durationFacts(years.map((point) => ({ ...point, value: point.value / 12 }))),
+          "USD/shares"
+        ),
+        WeightedAverageNumberOfDilutedSharesOutstanding: concept(
+          durationFacts(years.map((point) => ({ ...point, value: 10 }))),
+          "shares"
+        )
+      },
+      dei: {
+        EntityCommonStockSharesOutstanding: concept(
+          instantFacts(years.map((point) => ({ ...point, value: 11 }))),
+          "shares"
         )
       }
     }
@@ -158,8 +176,122 @@ test("순수 SEC 정규화 함수는 공시 facts에서 재무지표와 계보�
   assert.ok(Math.abs(normalized.metrics.fcfMargin - 16.6666666667) < 0.001);
   assert.equal(normalized.lineage.taxonomy, "us-gaap");
   assert.equal(normalized.lineage.tags.revenue, "Revenues");
+  assert.equal(normalized.financials.latest.freeCashFlow, 25);
+  assert.equal(normalized.financials.latest.epsDiluted, 12.5);
+  assert.equal(normalized.financials.latest.epsPeriodEnd, "2025-12-31");
+  assert.equal(normalized.financials.latest.sharesOutstanding, 11);
+  assert.equal(normalized.lineage.derived.freeCashFlow.samePeriod, true);
   assert.deepEqual(normalized.tickers, ["EXM", "EXM.A"]);
   assert.equal(normalized.disclosures.length, 1);
+});
+
+test("SEC FCF는 OCF와 CAPEX의 결산기가 같을 때만 계산한다", () => {
+  const facts = healthyFacts();
+  facts.facts["us-gaap"].PaymentsToAcquirePropertyPlantAndEquipment = concept(
+    durationFacts([
+      { year: 2023, value: 3 },
+      { year: 2024, value: 4 }
+    ])
+  );
+  const normalized = normalizeSecCompany(
+    {
+      id: "US-CIK0000000123",
+      cik: "0000000123",
+      ticker: "EXM",
+      tickers: ["EXM"],
+      exchange: "Nasdaq",
+      exchanges: ["Nasdaq"]
+    },
+    facts,
+    { ...operatingSubmission(), tickers: ["EXM"], exchanges: ["Nasdaq"] }
+  );
+  assert.equal(normalized.financials.latest.capex, null);
+  assert.equal(normalized.financials.latest.freeCashFlow, null);
+  assert.equal(normalized.metrics.fcfMargin, null);
+  assert.equal(normalized.lineage.derived.freeCashFlow.samePeriod, false);
+});
+
+test("SEC 현금흐름 파생값은 start/end/fy/fp/form/accn 문맥이 모두 같아야 한다", () => {
+  const facts = healthyFacts();
+  const operatingCashFlowFacts =
+    facts.facts["us-gaap"].NetCashProvidedByUsedInOperatingActivities.units.USD;
+  operatingCashFlowFacts.at(-1).start = "2025-01-02";
+  operatingCashFlowFacts.at(-1).accn = "0000000123-26-999999";
+
+  const normalized = normalizeSecCompany(
+    {
+      id: "US-CIK0000000123",
+      cik: "0000000123",
+      ticker: "EXM",
+      tickers: ["EXM"],
+      exchange: "Nasdaq",
+      exchanges: ["Nasdaq"]
+    },
+    facts,
+    { ...operatingSubmission(), tickers: ["EXM"], exchanges: ["Nasdaq"] }
+  );
+
+  assert.equal(normalized.financials.latest.operatingCashFlow, 30);
+  assert.equal(normalized.financials.latest.freeCashFlow, null);
+  assert.equal(normalized.metrics.fcfMargin, null);
+  assert.equal(normalized.metrics.cashConversion, null);
+  assert.equal(
+    normalized.lineage.derived.freeCashFlow.contextCompatible,
+    false
+  );
+  assert.equal(
+    normalized.lineage.derived.cashConversion.contextCompatible,
+    false
+  );
+});
+
+test("SEC 통화와 alias는 오래된 긴 시계열보다 최신 결산기를 우선한다", () => {
+  const staleUsd = durationFacts([
+    { year: 2016, value: 80 },
+    { year: 2017, value: 90 }
+  ]);
+  const eurRevenue = durationFacts([
+    { year: 2024, value: 100 },
+    { year: 2025, value: 120 }
+  ]);
+  const facts = {
+    facts: {
+      "ifrs-full": {
+        Revenue: {
+          units: { USD: staleUsd, EUR: eurRevenue }
+        },
+        ProfitLoss: concept(
+          durationFacts([
+            { year: 2024, value: 10 },
+            { year: 2025, value: 12 }
+          ]),
+          "EUR"
+        ),
+        ProfitLossFromOperatingActivities: concept(
+          durationFacts([
+            { year: 2024, value: 15 },
+            { year: 2025, value: 18 }
+          ]),
+          "EUR"
+        )
+      }
+    }
+  };
+  const normalized = normalizeSecCompany(
+    {
+      cik: "0000000123",
+      ticker: "EURC",
+      tickers: ["EURC"],
+      exchange: "NYSE",
+      exchanges: ["NYSE"]
+    },
+    facts,
+    { ...operatingSubmission(), tickers: ["EURC"], exchanges: ["NYSE"] }
+  );
+  assert.equal(normalized.currency, "EUR");
+  assert.equal(normalized.period, "FY 2025-12-31");
+  assert.equal(normalized.metrics.revenueGrowth, 20);
+  assert.equal(normalized.lineage.tags.operatingIncome, "ProfitLossFromOperatingActivities");
 });
 
 test("필수 facts가 없는 상장사도 예외 대신 insufficient_data 레코드로 보존한다", () => {
