@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { createLongviewApp } from "../server.mjs";
@@ -171,4 +171,92 @@ test("overview, paginated list, detail, ETag와 reload가 함께 동작한다", 
   assert.equal(health.status, "ok");
   assert.equal(health.companies, 6);
   assert.equal(health.dataLoadStatus, "ok");
+});
+
+test("원격 모드는 추적 파일을 건드리지 않고 runtime snapshot으로 자동 전환한다", async (t) => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "longview-runtime-api-"));
+  const dataFile = path.join(directory, "companies.json");
+  const runtimeDataFile = path.join(directory, ".cache", "companies.json");
+  const publicDir = path.join(directory, "public");
+  await mkdir(path.dirname(runtimeDataFile), { recursive: true });
+  await mkdir(publicDir);
+
+  const localText = JSON.stringify(snapshot([company(1)]));
+  const remoteText = JSON.stringify(
+    snapshot([company(1), company(2)], "2026-07-19T00:00:00.000Z")
+  );
+  await writeFile(dataFile, localText, "utf8");
+  await writeFile(runtimeDataFile, localText, "utf8");
+  const trackedBefore = await readFile(dataFile, "utf8");
+
+  let refreshCalls = 0;
+  let localSyncCalls = 0;
+  const config = {
+    dataFile,
+    runtimeDataFile,
+    publicDir,
+    remoteSnapshotUrl:
+      "https://raw.githubusercontent.com/example/longview/main/data/companies.json",
+    remoteSnapshotToken: "",
+    remoteSnapshotRefreshMs: 60_000,
+    host: "127.0.0.1",
+    port: 0,
+    schedulerEnabled: true,
+    scheduleHourKst: 21,
+    syncToken: ""
+  };
+  const app = await createLongviewApp(config, {
+    storeOptions: { refreshIntervalMs: 0 },
+    runtimeSnapshotPreparer: async () => ({
+      dataFile: runtimeDataFile,
+      source: "local",
+      etag: null
+    }),
+    remoteSnapshotRefresher: async () => {
+      refreshCalls += 1;
+      if (refreshCalls === 1) {
+        await writeFile(runtimeDataFile, remoteText, "utf8");
+        return {
+          attempted: true,
+          success: true,
+          changed: true,
+          etag: '"remote-v2"',
+          companyCount: 2,
+          updatedAt: "2026-07-19T00:00:00.000Z"
+        };
+      }
+      return {
+        attempted: true,
+        success: true,
+        changed: false,
+        notModified: true,
+        etag: '"remote-v2"',
+        companyCount: 2,
+        updatedAt: "2026-07-19T00:00:00.000Z"
+      };
+    },
+    syncRunner: async () => {
+      localSyncCalls += 1;
+      throw new Error("원격 모드에서 로컬 전체 sync를 실행하면 안 됩니다.");
+    }
+  });
+  await app.refreshRemoteSnapshot({ throwOnFailure: true });
+  const address = await app.listen();
+  const baseUrl = "http://127.0.0.1:" + address.port;
+  t.after(async () => {
+    await app.close();
+    await rm(directory, { recursive: true, force: true });
+  });
+
+  const overview = await (await fetch(baseUrl + "/api/overview")).json();
+  assert.equal(overview.summary.companies, 2);
+  assert.equal(await readFile(dataFile, "utf8"), trackedBefore);
+
+  await app.startSync();
+  assert.equal(localSyncCalls, 0);
+  assert.ok(refreshCalls >= 2);
+  const health = await (await fetch(baseUrl + "/api/health")).json();
+  assert.equal(health.schedulerMode, "remote_snapshot");
+  assert.equal(health.remoteSnapshot.status, "ok");
+  assert.equal(health.remoteSnapshot.source, "remote");
 });
