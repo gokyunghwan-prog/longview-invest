@@ -9,7 +9,7 @@ import {
   createCompanyStore,
   parseCompanyQuery
 } from "./lib/company-store.mjs";
-import { getScoringModel } from "./lib/scoring.mjs";
+import { SCORING_MODEL_VERSION, getScoringModel } from "./lib/scoring.mjs";
 import {
   prepareRuntimeSnapshot,
   refreshRemoteFullSnapshot
@@ -303,19 +303,44 @@ export async function createLongviewApp(
     }
 
     if (readMethod && url.pathname === "/api/methodology") {
-      const modelVersion = "1.0.0";
+      const modelVersion = SCORING_MODEL_VERSION;
       sendJson(
         request,
         response,
         200,
         {
           modelVersion,
-          name: "공시 기반 장기분석 모델 v1",
+          name: "가치·장기성장 분석 모델 v2",
           groups: getScoringModel(),
-          valuationIncluded: false,
+          valuationIncluded: true,
+          valuationRequiredForRanking: true,
           valuationDisplayed: true,
+          candidateRules: {
+            minimumTotal: 75,
+            minimumDataConfidence: 80,
+            minimumCompleteness: 80,
+            minimumHistoryYears: 3,
+            minimumValuationConfidence: 60,
+            componentMinimums: {
+              valuation: 60,
+              longGrowth: 55,
+              quality: 55,
+              safety: 45
+            },
+            minimumAnnualRoeWhenAvailable: 5,
+            minimumRevenueStabilityWhenAvailable: 40,
+            requiresLiveDisclosure: true,
+            requiresNoCriticalFlags: true,
+            excludesValueTrapSignals: true
+          },
+          rankingOrder: [
+            "candidateEligibility",
+            "evaluationReadiness",
+            "totalScore",
+            "dataConfidence"
+          ],
           note:
-            "검증된 시세와 같은 통화의 최신 연차 공시로 계산한 PER·PBR 등은 참고값이며 현재 총점에는 포함하지 않습니다."
+            "검증된 PER·PBR·PSR·FCF 수익률은 저평가 영역에 반영합니다. 가치지표가 부족하면 임의 점수 대신 가치 순위 평가를 보류하며, 재무 이력은 미래 수익을 보장하지 않습니다."
         },
         {
           cacheControl: "public, max-age=86400",

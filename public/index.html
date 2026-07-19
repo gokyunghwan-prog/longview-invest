@@ -91,7 +91,7 @@
       <section class="summary-strip" aria-label="요약 지표">
         <article>
           <span class="summary-index">01</span>
-          <div><strong id="summary-companies">—</strong><span>분석 기업</span></div>
+          <div><strong id="summary-companies">—</strong><span>수집 기업</span></div>
         </article>
         <article>
           <span class="summary-index">02</span>
@@ -99,11 +99,11 @@
         </article>
         <article>
           <span class="summary-index">03</span>
-          <div><strong id="summary-score">—</strong><span>평균 분석점수</span></div>
+          <div><strong id="summary-score">—</strong><span>평가가능 평균점수</span></div>
         </article>
         <article>
           <span class="summary-index">04</span>
-          <div><strong id="summary-confidence">—</strong><span>평균 데이터 신뢰도</span></div>
+          <div><strong id="summary-confidence">—</strong><span>평가가능 평균 신뢰도</span></div>
         </article>
       </section>
 
@@ -123,8 +123,8 @@
             <h2>장기 관점 기업 리스트</h2>
           </div>
           <p>
-            종합점수는 공개 공시를 정해진 규칙으로 비교한 연구 지표이며<br />
-            매수·매도 의견이나 미래 수익률 예측이 아닙니다.
+            종합점수는 검증된 가치지표와 공개 재무 이력을 비교한 연구 지표이며<br />
+            과거 근거를 활용한 가능성의 대용치일 뿐 미래 수익률 예측이 아닙니다.
           </p>
         </div>
 
@@ -157,7 +157,7 @@
           <label class="select-field">
             <span>정렬</span>
             <select id="sort-select">
-              <option value="score">분석점수 높은 순</option>
+              <option value="score">가치·장기 추천순</option>
               <option value="confidence">데이터 신뢰도 순</option>
               <option value="name">회사명 순</option>
             </select>
@@ -220,8 +220,9 @@
             <span>02</span>
             <h3>모르는 값은 비워두기</h3>
             <p>
-              시세가 연결되면 기준일·출처와 함께 PER을 계산하고, 없으면 만들지 않습니다.
-              결측치는 중립 처리하고 데이터 완전성과 후보 자격을 낮춥니다.
+              시세가 연결되면 기준일·출처와 함께 PER·PBR·PSR을 계산하고, 없으면 만들지
+              않습니다. 검증된 가치지표가 부족하면 0점을 만들지 않고 가치 순위 평가를
+              보류합니다.
             </p>
           </article>
           <article>
@@ -271,20 +272,22 @@
           ×
         </button>
         <div class="method-header">
-          <p class="section-kicker">METHODOLOGY · V1.0.0</p>
-          <h2>공시 기반 장기분석 모델</h2>
+          <p class="section-kicker">METHODOLOGY · V2.0.0</p>
+          <h2>가치·장기성장 분석 모델</h2>
           <p>
-            현재 버전은 일반 비금융회사를 위한 절대 구간 모델입니다. 누락된 지표는 다른
-            지표에 재배분하지 않고 중립점으로 수렴시키며 데이터 신뢰도를 별도로 낮춥니다.
+            저평가 30점, 장기성장 35점, 기업품질 20점, 재무안전 15점으로 일반
+            비금융회사를 비교합니다. 재무 이력은 장기 가능성을 살피는 근거이지 주가 상승을
+            예측하거나 보장하는 값이 아닙니다.
           </p>
         </div>
         <div class="method-groups" id="method-groups"></div>
         <div class="method-note">
           <strong>가격 지표는 점수에 어떻게 반영되나요?</strong>
           <p>
-            PER·PBR·FCF 수익률은 검증된 시세와 같은 통화의 연차 공시가 있을 때 별도
-            가치평가 영역에 표시합니다. 기업 간 시세 커버리지가 동일하지 않으므로 현재
-            장기분석 총점에는 넣지 않으며, N/A를 0점으로 계산하지 않습니다.
+            PER·PBR·PSR은 검증된 시세와 같은 통화의 연차 공시가 있을 때 저평가 영역과
+            총점에 반영합니다. 필요한 가치지표가 부족하면 N/A를 0점으로 만들지 않고
+            해당 기업의 가치 순위 평가를 보류합니다. 기본 추천순은 후보 안전조건을 먼저
+            적용한 뒤 같은 상태 안에서 점수순으로 정렬하며, 티어는 점수 구간을 뜻합니다.
           </p>
         </div>
       </div>
