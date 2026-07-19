@@ -10,6 +10,10 @@ import {
   parseCompanyQuery
 } from "./lib/company-store.mjs";
 import { getScoringModel } from "./lib/scoring.mjs";
+import {
+  prepareRuntimeSnapshot,
+  refreshRemoteFullSnapshot
+} from "./lib/remote-snapshot.mjs";
 import { syncAll } from "./lib/sync.mjs";
 
 const MIME_TYPES = {
@@ -112,21 +116,105 @@ function kstParts(date = new Date()) {
   return Object.fromEntries(parts.map((part) => [part.type, part.value]));
 }
 
+function safeRuntimeMessage(error, secrets = []) {
+  let message = error instanceof Error ? error.message : String(error);
+  for (const secret of secrets.filter(Boolean)) message = message.replaceAll(secret, "[REDACTED]");
+  return message
+    .replace(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi, "[redacted-email]")
+    .slice(0, 1_000);
+}
+
 export async function createLongviewApp(
   config = getRuntimeConfig(),
-  { companyStore = null, storeOptions = undefined, syncRunner = syncAll } = {}
+  {
+    companyStore = null,
+    storeOptions = undefined,
+    syncRunner = syncAll,
+    runtimeSnapshotPreparer = prepareRuntimeSnapshot,
+    remoteSnapshotRefresher = refreshRemoteFullSnapshot
+  } = {}
 ) {
-  const store = companyStore || (await createCompanyStore(config.dataFile, storeOptions));
+  const remoteMode = Boolean(config.remoteSnapshotUrl && !companyStore);
+  const preparedRuntime = remoteMode
+    ? await runtimeSnapshotPreparer(config)
+    : null;
+  const store = companyStore ||
+    (await createCompanyStore(preparedRuntime?.dataFile || config.dataFile, storeOptions));
   let activeSync = null;
+  let activeRemoteRefresh = null;
   let lastScheduledDate = null;
   let scheduleTimer = null;
+  let remoteRefreshTimer = null;
+  let remoteEtag = preparedRuntime?.etag || null;
+  const remoteSnapshotStatus = {
+    enabled: remoteMode,
+    status: remoteMode ? "ready" : "disabled",
+    source: preparedRuntime?.source || (remoteMode ? "local" : null),
+    lastAttemptAt: null,
+    lastSuccessAt: null,
+    sourceUpdatedAt: null,
+    error: null
+  };
 
   async function refreshStore() {
     await store.refreshIfChanged();
   }
 
+  async function refreshRemoteStore({ throwOnFailure = false } = {}) {
+    if (!remoteMode) {
+      return { attempted: false, success: false, changed: false };
+    }
+    if (activeRemoteRefresh) return activeRemoteRefresh;
+
+    activeRemoteRefresh = (async () => {
+      remoteSnapshotStatus.lastAttemptAt = new Date().toISOString();
+      remoteSnapshotStatus.status = "refreshing";
+      try {
+        const result = await remoteSnapshotRefresher(config, {
+          etag: remoteEtag,
+          onProgress: (message) =>
+            console.log("[" + new Date().toISOString() + "] " + message)
+        });
+        if (!result?.success) {
+          throw new Error(result?.error || "GitHub 최신 snapshot을 받지 못했습니다.");
+        }
+        if (result.etag) remoteEtag = result.etag;
+        if (result.changed) await store.reload();
+        remoteSnapshotStatus.status = "ok";
+        remoteSnapshotStatus.source = "remote";
+        remoteSnapshotStatus.lastSuccessAt = new Date().toISOString();
+        remoteSnapshotStatus.sourceUpdatedAt =
+          result.updatedAt || remoteSnapshotStatus.sourceUpdatedAt;
+        remoteSnapshotStatus.error = null;
+        return result;
+      } catch (error) {
+        const message = safeRuntimeMessage(error, [config.remoteSnapshotToken]);
+        remoteSnapshotStatus.status = "stale";
+        remoteSnapshotStatus.error = message;
+        if (throwOnFailure) throw new Error(message);
+        console.error("GitHub 최신 snapshot 확인 실패, 마지막 정상 데이터 유지:", message);
+        return { attempted: true, success: false, changed: false, error: message };
+      }
+    })().finally(() => {
+      activeRemoteRefresh = null;
+    });
+    return activeRemoteRefresh;
+  }
+
   async function startSync() {
     if (activeSync) return activeSync;
+    if (remoteMode) {
+      activeSync = (async () => {
+        const result = await refreshRemoteStore();
+        if (!result.success) {
+          throw new Error(result.error || "GitHub 최신 snapshot을 받지 못했습니다.");
+        }
+        return result;
+      })().finally(() => {
+        activeSync = null;
+      });
+      return activeSync;
+    }
     activeSync = (async () => {
       try {
         return await syncRunner(config, {
@@ -241,8 +329,10 @@ export async function createLongviewApp(
       await refreshStore();
       sendJson(request, response, 200, {
         status: "ok",
-        syncing: Boolean(activeSync),
+        syncing: Boolean(activeSync || activeRemoteRefresh),
         scheduler: Boolean(config.schedulerEnabled),
+        schedulerMode: remoteMode ? "remote_snapshot" : "local_sync",
+        remoteSnapshot: { ...remoteSnapshotStatus },
         ...store.getStatus()
       });
       return;
@@ -325,6 +415,17 @@ export async function createLongviewApp(
       scheduleTimer = setInterval(checkSchedule, 5 * 60 * 1000);
       scheduleTimer.unref();
     }
+    if (remoteMode && !remoteRefreshTimer) {
+      const refreshIntervalMs = Math.max(
+        60_000,
+        Number(config.remoteSnapshotRefreshMs) || 30 * 60 * 1000
+      );
+      remoteRefreshTimer = setInterval(() => {
+        void refreshRemoteStore();
+      }, refreshIntervalMs);
+      remoteRefreshTimer.unref();
+      void refreshRemoteStore();
+    }
     return server.address();
   }
 
@@ -333,13 +434,25 @@ export async function createLongviewApp(
       clearInterval(scheduleTimer);
       scheduleTimer = null;
     }
+    if (remoteRefreshTimer) {
+      clearInterval(remoteRefreshTimer);
+      remoteRefreshTimer = null;
+    }
     if (!server.listening) return;
     await new Promise((resolve, reject) => {
       server.close((error) => (error ? reject(error) : resolve()));
     });
   }
 
-  return { server, store, startSync, handleRequest, listen, close };
+  return {
+    server,
+    store,
+    startSync,
+    refreshRemoteSnapshot: refreshRemoteStore,
+    handleRequest,
+    listen,
+    close
+  };
 }
 
 function isMainModule() {
@@ -353,7 +466,9 @@ if (isMainModule()) {
   await app.listen();
   console.log(
     "Longview 서버: http://" + config.host + ":" + config.port +
-      (config.schedulerEnabled
+      (config.remoteSnapshotUrl
+        ? " · GitHub 최신 snapshot 시작 즉시·30분마다 자동 확인"
+        : config.schedulerEnabled
         ? " · 매일 " + config.scheduleHourKst + "시(KST) 자동 갱신"
         : " · 서버 스케줄러 꺼짐")
   );

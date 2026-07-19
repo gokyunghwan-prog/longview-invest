@@ -13,7 +13,8 @@ npm.cmd start
 ~~~
 
 브라우저에서 <http://127.0.0.1:4173>을 엽니다. 외부 패키지 설치는 필요 없고
-Node.js 20 이상만 있으면 됩니다.
+Node.js 20 이상만 있으면 됩니다. `.env`에 `REMOTE_SNAPSHOT_URL`이 있으면 서버는
+시작 직후 GitHub의 최신 데이터를 확인하고, 이후 30분마다 변경 여부만 다시 확인합니다.
 
 코드를 검사하려면 다음 한 줄만 실행합니다.
 
@@ -125,19 +126,21 @@ Actions 화면에서 다시 활성화할 수 있습니다.
 
 ### GitHub의 전체 데이터를 이 로컬 화면에 받기
 
-GitHub Actions가 갱신해도 이 컴퓨터의 파일이 저절로 바뀌지는 않습니다. 공개 저장소를
-만든 뒤 `.env`에 아래 raw 주소를 추가하면 로컬 일일 스케줄러가 최신 전체 스냅샷을
-받아 한국·미국 공시와 공개 시세를 병합합니다.
+공개 저장소를 만든 뒤 `.env`에 아래 raw 주소를 한 번만 추가합니다.
 
 ~~~dotenv
 REMOTE_SNAPSHOT_URL=https://raw.githubusercontent.com/사용자명/저장소명/main/data/companies.json
-ENABLE_SCHEDULER=true
-SCHEDULE_HOUR_KST=21
 ~~~
 
-사이트가 켜져 있으면 매일 21시 KST에 자동 갱신합니다. 수동으로 바로 확인하려면
-`npm.cmd run sync`를 한 번 실행하면 됩니다. GitHub 저장소가 비공개라면 raw 주소 대신
-배포 서버나 인증된 객체 저장소가 필요합니다.
+이후에는 `npm.cmd start`만 실행하면 됩니다. 서버가 시작 직후 최신 GitHub snapshot을
+`.cache/companies.json`에 안전하게 받고, 켜져 있는 동안 30분마다 ETag로 변경 여부를
+확인합니다. GitHub 데이터가 바뀌면 서버와 열어 둔 화면이 자동으로 새 revision을 읽습니다.
+인터넷이 잠시 끊겨도 마지막 정상 cache를 계속 사용하며, Git이 추적하는
+`data/companies.json`은 수정하지 않습니다. GitHub 저장소가 비공개라면 raw 주소 대신
+별도 배포 서버나 인증된 객체 저장소가 필요합니다.
+
+`REMOTE_SNAPSHOT_URL`을 사용하지 않고 이 노트북 CPU로 직접 전체시장을 수집할 때만
+`ENABLE_SCHEDULER=true`와 `SCHEDULE_HOUR_KST`를 설정합니다.
 
 GitHub Actions의 첫 성공 실행 전에는 미국 회사 수가 0으로 표시됩니다. 실제 공시가
 아닌 예시 회사를 전체시장 목록에 섞어 보여주지는 않습니다.
@@ -198,8 +201,8 @@ SEC 연락정보는 브라우저로 전달되지 않습니다.
 - `US_LICENSED_PRICE_SNAPSHOT_TOKEN`: 위 snapshot 인증 토큰(선택)
 - `US_LICENSED_PRICE_ALLOWED_HOSTS`: 운영자가 승인한 snapshot host 목록(쉼표 구분)
 - `REMOTE_SNAPSHOT_URL`: GitHub Actions가 커밋한 공개 snapshot raw 주소(선택)
-- `ENABLE_SCHEDULER`: 로컬 서버 자동 갱신 여부
-- `SCHEDULE_HOUR_KST`: 로컬 자동 갱신 시각, GitHub 완료 뒤인 21시 권장
+- `ENABLE_SCHEDULER`: 원격 snapshot 없이 이 컴퓨터에서 직접 전체수집할 때만 사용
+- `SCHEDULE_HOUR_KST`: 위 로컬 전체수집 시각
 - `SYNC_TOKEN`: 보호된 `POST /api/sync`를 사용할 때만 설정
 
 ## 구현 명세와 공식 문서
