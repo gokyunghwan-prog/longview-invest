@@ -3,15 +3,12 @@ import { pathToFileURL } from "node:url";
 import path from "node:path";
 
 import { getRuntimeConfig } from "../lib/config.mjs";
+import { normalizeKoreanSnapshot } from "../lib/korean-snapshot.mjs";
 import {
   enrichKrCompaniesWithPrices,
   fetchLatestKrStockPrices,
   KR_STOCK_PRICE_SOURCE
 } from "../lib/providers/kr-stock-price.mjs";
-import {
-  enrichUsCompaniesWithLicensedPrices,
-  fetchLicensedUsSnapshot
-} from "../lib/providers/licensed-stock-price.mjs";
 import { acquireSyncLock, writeDataset } from "../lib/store.mjs";
 
 const DEFAULT_MAX_QUOTE_AGE_DAYS = 10;
@@ -29,7 +26,6 @@ function safeMessage(error, secrets = []) {
   }
   return message
     .replace(/([?&](?:serviceKey|apiKey|api_key|token|key)=)[^&\s]+/gi, "$1[REDACTED]")
-    .replace(/(authorization\s*:\s*bearer\s+)[^\s,}]+/gi, "$1[REDACTED]")
     .slice(0, 1_000);
 }
 
@@ -85,9 +81,9 @@ function quoteAgeDays(asOf, now) {
   return Math.floor((now.getTime() - date.getTime()) / 86_400_000);
 }
 
-function preserveExistingQuotes(companies, country, now, maxAgeDays) {
+function preserveExistingQuotes(companies, now, maxAgeDays) {
   return companies.map((company) => {
-    if (company.country !== country || company.marketData?.usageMode !== "public") return company;
+    if (company.marketData?.usageMode !== "public") return company;
     const ageDays = quoteAgeDays(company.marketData.asOf, now);
     const freshness = ageDays >= 0 && ageDays <= maxAgeDays ? "current" : "stale";
     return {
@@ -104,28 +100,27 @@ function preserveExistingQuotes(companies, country, now, maxAgeDays) {
 
 function marketDataCounts(companies) {
   const result = {
-    coverage: { kr: 0, us: 0 },
-    available: { kr: 0, us: 0 },
-    preserved: { kr: 0, us: 0 },
-    stale: { kr: 0, us: 0 }
+    coverage: { kr: 0 },
+    available: { kr: 0 },
+    preserved: { kr: 0 },
+    stale: { kr: 0 }
   };
   for (const company of companies) {
-    const key = company.country === "KR" ? "kr" : company.country === "US" ? "us" : null;
     const quote = company.marketData;
-    if (!key || quote?.usageMode !== "public" || !Number.isFinite(quote.price)) continue;
-    result.available[key] += 1;
-    if (quote.status === "ok" && quote.freshness === "current") result.coverage[key] += 1;
-    if (quote.status === "preserved") result.preserved[key] += 1;
-    if (quote.status === "stale" || quote.freshness === "stale") result.stale[key] += 1;
+    if (quote?.usageMode !== "public" || !Number.isFinite(quote.price)) continue;
+    result.available.kr += 1;
+    if (quote.status === "ok" && quote.freshness === "current") result.coverage.kr += 1;
+    if (quote.status === "preserved") result.preserved.kr += 1;
+    if (quote.status === "stale" || quote.freshness === "stale") result.stale.kr += 1;
   }
   return result;
 }
 
-function previousMatched(dataset, code, country) {
+function previousMatched(dataset, code) {
   const provider = previousProvider(dataset.meta, code);
   if (Number.isInteger(provider?.matched) && provider.matched > 0) return provider.matched;
   return (dataset.companies || []).filter(
-    (company) => company.country === country && company.marketData?.usageMode === "public"
+    (company) => company.marketData?.usageMode === "public"
   ).length;
 }
 
@@ -153,31 +148,19 @@ export async function syncStockPrices(config = getRuntimeConfig(), options = {})
   const release = options.acquireLock === false
     ? async () => {}
     : await acquireSyncLock(config.dataFile);
-  const secrets = [
-    config.dataGoKrApiKey,
-    config.usLicensedPriceSnapshotToken,
-    config.usLicensedPriceSnapshotUrl
-  ];
+  const secrets = [config.dataGoKrApiKey];
 
   try {
-    const dataset = await readJson(config.dataFile);
-    let companies = dataset.companies || [];
-    companies = preserveExistingQuotes(companies, "KR", now, maxAgeDays);
-    companies = preserveExistingQuotes(companies, "US", now, maxAgeDays);
-    const providers = {
-      KR: providerState(
-        "KR_PUBLIC",
-        "금융위원회 주식시세정보",
-        Boolean(config.dataGoKrApiKey),
-        previousProvider(dataset.meta, "KR_PUBLIC")
-      ),
-      US: providerState(
-        "US_LICENSED_PUBLIC",
-        "사용자 라이선스 미국 시세 snapshot",
-        Boolean(config.usLicensedPriceSnapshotUrl),
-        previousProvider(dataset.meta, "US_LICENSED_PUBLIC")
-      )
-    };
+    const sourceDataset = await readJson(config.dataFile);
+    const previousMarketDataUpdatedAt = sourceDataset.meta?.marketData?.updatedAt || null;
+    const dataset = normalizeKoreanSnapshot(sourceDataset);
+    let companies = preserveExistingQuotes(dataset.companies || [], now, maxAgeDays);
+    const provider = providerState(
+      "KR_PUBLIC",
+      "금융위원회 주식시세정보",
+      Boolean(config.dataGoKrApiKey),
+      previousProvider(dataset.meta, "KR_PUBLIC")
+    );
     const addedSources = [];
 
     if (config.dataGoKrApiKey) {
@@ -192,12 +175,12 @@ export async function syncStockPrices(config = getRuntimeConfig(), options = {})
           fetchedAt: generatedAt,
           now,
           maxAgeDays,
-          previousMatched: previousMatched(dataset, "KR_PUBLIC", "KR"),
+          previousMatched: previousMatched(dataset, "KR_PUBLIC"),
           ...(options.krCoverageOptions || {})
         });
         if (enriched.applied < 1) throw new Error("한국 시세가 실제 회사에 한 건도 반영되지 않았습니다.");
         companies = enriched.companies;
-        Object.assign(providers.KR, {
+        Object.assign(provider, {
           status: "ok",
           asOf: enriched.asOf,
           matched: enriched.coverage.matched,
@@ -210,72 +193,23 @@ export async function syncStockPrices(config = getRuntimeConfig(), options = {})
         });
         addedSources.push(KR_STOCK_PRICE_SOURCE);
       } catch (error) {
-        providers.KR.status = "failed_preserved";
-        providers.KR.error = safeMessage(error, secrets);
-        progress("한국 시세 보존: " + providers.KR.error);
+        provider.status = "failed_preserved";
+        provider.error = safeMessage(error, secrets);
+        progress("한국 시세 보존: " + provider.error);
       }
     }
 
-    if (config.usLicensedPriceSnapshotUrl) {
-      try {
-        progress("재배포 라이선스 보유 미국 시세 snapshot 수집");
-        const snapshot = await fetchLicensedUsSnapshot({
-          url: config.usLicensedPriceSnapshotUrl,
-          token: config.usLicensedPriceSnapshotToken,
-          allowedHosts: config.usLicensedPriceAllowedHosts,
-          now,
-          maxAgeDays,
-          fetchJsonImpl: options.fetchLicensedJsonImpl
-        });
-        const enriched = enrichUsCompaniesWithLicensedPrices(companies, snapshot, {
-          fetchedAt: generatedAt,
-          now,
-          maxAgeDays,
-          previousMatched: previousMatched(dataset, "US_LICENSED_PUBLIC", "US"),
-          ...(options.usCoverageOptions || {})
-        });
-        if (enriched.applied < 1) throw new Error("미국 시세가 실제 회사에 한 건도 반영되지 않았습니다.");
-        companies = enriched.companies;
-        Object.assign(providers.US, {
-          provider: snapshot.manifest.provider,
-          status: "ok",
-          asOf: enriched.asOf,
-          matched: enriched.coverage.matched,
-          applied: enriched.applied,
-          preservedNewer: enriched.preservedNewer,
-          total: enriched.coverage.total,
-          lastSuccessAt: generatedAt,
-          lastSuccessAsOf: enriched.asOf,
-          error: null,
-          licenseReference: snapshot.manifest.licenseReference,
-          licenseId: snapshot.manifest.licenseId,
-          rightsReviewedAt: snapshot.manifest.rightsReviewedAt
-        });
-        addedSources.push({
-          name: snapshot.manifest.provider,
-          url: snapshot.manifest.sourceUrl,
-          licenseReference: snapshot.manifest.licenseReference,
-          licenseId: snapshot.manifest.licenseId,
-          rightsReviewedAt: snapshot.manifest.rightsReviewedAt
-        });
-      } catch (error) {
-        providers.US.status = "failed_preserved";
-        providers.US.error = safeMessage(error, secrets);
-        progress("미국 공개 시세 보존: " + providers.US.error);
-      }
-    }
-
-    const providerList = Object.values(providers);
+    const providerList = [provider];
     const counts = marketDataCounts(companies);
-    const anyApplied = providerList.some((provider) => provider.status === "ok" && provider.applied > 0);
+    const anyApplied = provider.status === "ok" && provider.applied > 0;
     const marketData = {
-      updatedAt: anyApplied ? generatedAt : dataset.meta?.marketData?.updatedAt || null,
+      updatedAt:
+        anyApplied
+          ? generatedAt
+          : dataset.meta?.marketData?.updatedAt || previousMarketDataUpdatedAt,
       lastAttemptAt: generatedAt,
       maxQuoteAgeDays: maxAgeDays,
-      coverage: counts.coverage,
-      available: counts.available,
-      preserved: counts.preserved,
-      stale: counts.stale,
+      ...counts,
       providers: providerList
     };
     const nextDataset = {
@@ -300,7 +234,7 @@ export async function syncStockPrices(config = getRuntimeConfig(), options = {})
     if (failures.length > 0 && options.failOnConfiguredProviderError !== false) {
       const error = new Error(
         "설정된 시세 공급자 갱신 실패: " +
-          failures.map((provider) => `${provider.code} (${provider.error})`).join(" · ")
+          failures.map((item) => `${item.code} (${item.error})`).join(" · ")
       );
       error.result = result;
       throw error;

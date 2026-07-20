@@ -1,7 +1,6 @@
 import { getRuntimeConfig } from "../lib/config.mjs";
 import { mergeMarketDatasets } from "../lib/market-dataset.mjs";
 import { syncDartMarket } from "../lib/providers/dart-market.mjs";
-import { syncUsBulk } from "./sync-us-bulk.mjs";
 import { syncStockPrices } from "./sync-stock-prices.mjs";
 
 function safeMessage(error) {
@@ -16,12 +15,6 @@ const runs = {
   KR: {
     provider: "Open DART",
     attempted: Boolean(config.dartApiKey),
-    success: false,
-    error: null
-  },
-  US: {
-    provider: "SEC EDGAR bulk",
-    attempted: Boolean(config.secUserAgent),
     success: false,
     error: null
   }
@@ -43,29 +36,11 @@ if (runs.KR.attempted) {
   runs.KR.error = "DART_API_KEY가 설정되지 않았습니다.";
 }
 
-if (runs.US.attempted) {
-  try {
-    const result = await syncUsBulk({
-      output: config.usMarketDataFile,
-      onProgress: (message) => console.log("[SEC] " + message)
-    });
-    runs.US.success = true;
-    runs.US.companyCount = result.companies.length;
-  } catch (error) {
-    runs.US.error = safeMessage(error);
-    console.error("[SEC] 실패: " + runs.US.error);
-  }
-} else {
-  runs.US.error = "SEC_USER_AGENT가 설정되지 않았습니다.";
-}
-
 let mergeSucceeded = false;
 try {
   const dataset = await mergeMarketDatasets(config, { runs });
   mergeSucceeded = true;
-  console.log(
-    `[MERGE] 한국 ${dataset.meta.coverage.kr}개 · 미국 ${dataset.meta.coverage.us}개 · ${dataset.meta.sync.status}`
-  );
+  console.log(`[MERGE] 한국 ${dataset.meta.coverage.kr}개 · ${dataset.meta.sync.status}`);
 } catch (error) {
   console.error("[MERGE] " + safeMessage(error));
   process.exitCode = 1;
@@ -91,4 +66,4 @@ if (mergeSucceeded) {
   }
 }
 
-if (!runs.KR.success || !runs.US.success) process.exitCode = 1;
+if (!runs.KR.success) process.exitCode = 1;

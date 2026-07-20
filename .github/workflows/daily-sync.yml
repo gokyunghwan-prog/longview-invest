@@ -1,13 +1,13 @@
-name: Daily full-market disclosure sync
+name: Daily Korean market sync
 
 on:
   schedule:
-    # 19:35 KST. SEC bulk archives are republished around 03:00 ET.
+    # 매일 19:35 KST. 한국 공식 종가(T+1)와 최신 DART 공시를 반영합니다.
     - cron: "35 10 * * *"
   workflow_dispatch:
 
 concurrency:
-  group: full-market-disclosure-sync
+  group: korean-market-sync
   cancel-in-progress: false
 
 permissions:
@@ -16,25 +16,19 @@ permissions:
 jobs:
   sync:
     runs-on: ubuntu-latest
-    # 첫 전체시장 재무·DART 현금흐름 보강과 일시적인 API 지연 여유를 둡니다.
     timeout-minutes: 360
 
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Set up Node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: "22"
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-
       - name: Restore DART universe checkpoints
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@0400d5f644dc74513175e3cd8d07132dd4860809 # v4.2.4
         with:
           path: data/dart-market
           key: dart-market-${{ runner.os }}-${{ github.run_id }}
@@ -42,9 +36,7 @@ jobs:
             dart-market-${{ runner.os }}-
 
       - name: Validate collectors and scoring
-        run: |
-          npm run check
-          python -m unittest discover -s tests -p "test_*.py"
+        run: npm run check
 
       - name: Preserve previous public snapshot baseline
         run: |
@@ -52,23 +44,32 @@ jobs:
             cp data/companies.json "$RUNNER_TEMP/previous-companies.json"
           fi
 
-      - name: Sync KOSPI, KOSDAQ, NYSE, Nasdaq and CBOE
+      - name: Sync KOSPI and KOSDAQ
         id: market_sync
         continue-on-error: true
         run: npm run sync:daily
         env:
           DART_API_KEY: ${{ secrets.DART_API_KEY }}
-          SEC_USER_AGENT: ${{ secrets.SEC_USER_AGENT }}
           DATA_GO_KR_API_KEY: ${{ secrets.DATA_GO_KR_API_KEY }}
-          US_LICENSED_PRICE_SNAPSHOT_URL: ${{ secrets.US_LICENSED_PRICE_SNAPSHOT_URL }}
-          US_LICENSED_PRICE_SNAPSHOT_TOKEN: ${{ secrets.US_LICENSED_PRICE_SNAPSHOT_TOKEN }}
-          US_LICENSED_PRICE_ALLOWED_HOSTS: ${{ secrets.US_LICENSED_PRICE_ALLOWED_HOSTS }}
           ALLOW_PRICE_PROVIDER_FAILURE: "true"
-          PYTHON: python
+
+      - name: Verify configured price providers before publishing
+        id: price_validation
+        if: steps.market_sync.outcome == 'success'
+        continue-on-error: true
+        run: npm run verify:prices
+        env:
+          REQUIRE_KR_PRICE_PROVIDER: "true"
+
+      - name: Generate the shared website and autotrade selection
+        id: selection_generation
+        if: steps.market_sync.outcome == 'success' && steps.price_validation.outcome == 'success'
+        continue-on-error: true
+        run: npm run generate:selection
 
       - name: Validate generated snapshot
         id: snapshot_validation
-        if: steps.market_sync.outcome == 'success'
+        if: steps.market_sync.outcome == 'success' && steps.price_validation.outcome == 'success' && steps.selection_generation.outcome == 'success'
         run: |
           if [ -f "$RUNNER_TEMP/previous-companies.json" ]; then
             npm run validate:snapshot -- --previous "$RUNNER_TEMP/previous-companies.json"
@@ -79,40 +80,43 @@ jobs:
       - name: Save DART universe checkpoints
         if: always()
         continue-on-error: true
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@0400d5f644dc74513175e3cd8d07132dd4860809 # v4.2.4
         with:
           path: data/dart-market
           key: dart-market-${{ runner.os }}-${{ github.run_id }}
 
       - name: Upload sync diagnostics
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: full-market-sync-diagnostics-${{ github.run_id }}
+          name: korean-market-sync-diagnostics-${{ github.run_id }}
           path: |
             data/sync-diagnostics.json
-            data/us-sync-diagnostics.json
             data/price-sync-diagnostics.json
           if-no-files-found: ignore
           retention-days: 14
 
       - name: Commit updated public snapshot
-        if: steps.market_sync.outcome == 'success' && steps.snapshot_validation.outcome == 'success'
+        if: steps.market_sync.outcome == 'success' && steps.price_validation.outcome == 'success' && steps.selection_generation.outcome == 'success' && steps.snapshot_validation.outcome == 'success'
         run: |
-          if [ -z "$(git status --porcelain -- data/companies.json)" ]; then
+          if [ -z "$(git status --porcelain -- data/companies.json data/trading-selection.json)" ]; then
             echo "No public snapshot changes"
             exit 0
           fi
           git config user.name "longview-data-bot"
           git config user.email "longview-data-bot@users.noreply.github.com"
-          git add data/companies.json
-          git commit -m "data: daily full-market snapshot"
+          git add data/companies.json data/trading-selection.json
+          git commit -m "data: daily Korean market snapshot and selection"
           git push
 
-      - name: Report configured price-provider failures
-        if: steps.market_sync.outcome == 'success' && steps.snapshot_validation.outcome == 'success'
-        run: npm run verify:prices
-
-      - name: Fail when a market collector failed
+      - name: Fail when the Korean market collector failed
         if: steps.market_sync.outcome == 'failure'
+        run: exit 1
+
+      - name: Fail when a configured price provider failed
+        if: steps.market_sync.outcome == 'success' && steps.price_validation.outcome == 'failure'
+        run: exit 1
+
+      - name: Fail when the shared investment selection failed
+        if: steps.selection_generation.outcome == 'failure'
         run: exit 1

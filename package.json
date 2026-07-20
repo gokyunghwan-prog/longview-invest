@@ -3,19 +3,28 @@
   "version": "1.0.0",
   "private": true,
   "type": "module",
-  "description": "한국 DART와 미국 SEC 공시 기반 장기투자 리서치 스크리너",
+  "description": "한국 DART 공시 기반 가치·장기투자 리서치 스크리너",
   "scripts": {
     "dev": "node --watch server.mjs",
     "start": "node server.mjs",
     "sync": "node scripts/sync.mjs",
     "sync:kr-market": "node scripts/sync-kr-market.mjs",
-    "sync:us-market": "node scripts/sync-us-bulk.mjs",
     "sync:daily": "node scripts/sync-daily-markets.mjs",
     "sync:prices": "node scripts/sync-stock-prices.mjs",
     "verify:prices": "node scripts/verify-price-sync.mjs",
     "merge:markets": "node scripts/merge-market-data.mjs",
     "validate:snapshot": "node scripts/validate-snapshot.mjs",
-    "check": "node --check server.mjs && node --check public/app.js && node --check scripts/sync-daily-markets.mjs && node --check scripts/sync-stock-prices.mjs && node --check scripts/verify-price-sync.mjs && node --check scripts/sync-us-bulk.mjs && node --check scripts/validate-snapshot.mjs && node --test"
+    "generate:selection": "node scripts/generate-investment-selection.mjs",
+    "trade:plan": "node scripts/autotrade.mjs plan",
+    "trade:run": "node scripts/autotrade.mjs run",
+    "trade:status": "node scripts/autotrade.mjs status",
+    "trade:stop": "node scripts/autotrade.mjs stop",
+    "trade:resume": "node scripts/autotrade.mjs resume",
+    "trade:resolve": "node scripts/autotrade.mjs resolve-inflight",
+    "trade:resolve-pending": "node scripts/autotrade.mjs resolve-pending",
+    "trade:verify-kis": "node scripts/verify-kis-connection.mjs",
+    "trade:start": "node autotrade/server.mjs",
+    "check": "node --check server.mjs && node --check public/app.js && node --check autotrade/server.mjs && node --check scripts/autotrade.mjs && node --check scripts/cloud-autotrade.mjs && node --check scripts/generate-investment-selection.mjs && node --check scripts/verify-kis-connection.mjs && node --check scripts/sync-daily-markets.mjs && node --check scripts/sync-stock-prices.mjs && node --check scripts/verify-price-sync.mjs && node --check scripts/normalize-korean-snapshot.mjs && node --check scripts/validate-snapshot.mjs && node --test"
   },
   "engines": {
     "node": ">=20"

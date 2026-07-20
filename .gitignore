@@ -4,14 +4,13 @@
 node_modules/
 coverage/
 .cache/
+.autotrade/
 data/.sync-lock
 data/*.tmp
 data/**/*.tmp
 data/*.tmp-*
 data/**/*.tmp-*
 data/dart-market/
-data/us-companies.json
-data/remote-market-data.json
 data/*diagnostics.json
 *.log
 __pycache__/

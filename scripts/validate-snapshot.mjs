@@ -26,7 +26,7 @@ export function parseSnapshotValidationArgs(argv) {
   const options = {
     file: path.join(ROOT_DIR, "data", "companies.json"),
     previous: null,
-    requiredCountries: ["KR", "US"],
+    requiredCountries: ["KR"],
     minimumCounts: { ...DEFAULT_MINIMUM_COUNTS },
     maxDropFraction: DEFAULT_MAX_DROP_FRACTION
   };
@@ -38,14 +38,12 @@ export function parseSnapshotValidationArgs(argv) {
     else if (option === "--previous" && value) options.previous = path.resolve(value);
     else if (option === "--country" && value) {
       const country = value.toUpperCase();
-      if (!new Set(["ALL", "KR", "US"]).has(country)) {
-        throw new Error("--country must be ALL, KR, or US.");
+      if (country !== "KR") {
+        throw new Error("--country must be KR.");
       }
-      options.requiredCountries = country === "ALL" ? ["KR", "US"] : [country];
+      options.requiredCountries = [country];
     } else if (option === "--minimum-kr" && value) {
       options.minimumCounts.KR = positiveInteger(value, option);
-    } else if (option === "--minimum-us" && value) {
-      options.minimumCounts.US = positiveInteger(value, option);
     } else if (option === "--max-drop-percent" && value) {
       const percent = Number(value);
       if (!Number.isFinite(percent) || percent < 0 || percent >= 100) {
@@ -82,7 +80,7 @@ async function main() {
   const options = parseSnapshotValidationArgs(process.argv.slice(2));
   const report = await validateSnapshotFile(options);
   console.log(
-    `Snapshot valid: total=${report.counts.total}, KR=${report.counts.KR}, US=${report.counts.US}`
+    `Snapshot valid: total=${report.counts.total}, KR=${report.counts.KR}`
   );
 }
 

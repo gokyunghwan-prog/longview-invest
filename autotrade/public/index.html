@@ -1,0 +1,315 @@
+<!doctype html>
+<html lang="ko">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="light" />
+    <meta
+      name="description"
+      content="Longview 장기투자 신호를 사용하는 읽기·모의실행 전용 자동매매 안전 대시보드"
+    />
+    <title>Longview Auto — 자동매매 안전 대시보드</title>
+    <link rel="stylesheet" href="./styles.css" />
+    <script src="./app.js" type="module"></script>
+  </head>
+  <body>
+    <a class="skip-link" href="#main-content">본문으로 바로가기</a>
+
+    <header class="site-header">
+      <a class="brand" href="./" aria-label="Longview Auto 홈">
+        <span class="brand-mark" aria-hidden="true"><i></i><i></i><i></i></span>
+        <span>
+          <strong>LONGVIEW</strong>
+          <small>AUTO · SAFETY CONSOLE</small>
+        </span>
+      </a>
+
+      <div class="header-status">
+        <span id="connection-dot" class="connection-dot" aria-hidden="true"></span>
+        <span id="connection-label">서버 확인 중</span>
+        <span id="mode-badge" class="mode-badge mode-disabled">DISABLED</span>
+      </div>
+    </header>
+
+    <main id="main-content">
+      <section class="hero" aria-labelledby="page-title">
+        <div class="eyebrow">AUTOMATED INVESTING · CONTROL ROOM</div>
+        <div class="hero-grid">
+          <div>
+            <h1 id="page-title">자동매매<br /><em>안전 대시보드</em></h1>
+            <p class="hero-copy">
+              Longview의 가치·장기투자 신호로 계획을 만들고, 실제 돈을 쓰지 않는
+              모의계좌에서 먼저 검증합니다.
+            </p>
+          </div>
+
+          <aside class="live-lock" aria-labelledby="live-lock-title">
+            <div class="lock-icon" aria-hidden="true">
+              <span></span>
+            </div>
+            <div>
+              <p class="micro-label">PERMANENT UI GUARD</p>
+              <h2 id="live-lock-title">이 화면에서는 실전 주문 불가</h2>
+              <p>
+                실전 모드 설정 여부와 관계없이 이 대시보드에는 실전 주문 버튼과
+                실행 경로가 없습니다.
+              </p>
+            </div>
+          </aside>
+        </div>
+      </section>
+
+      <div id="notice" class="notice notice-info" role="status" aria-live="polite">
+        <span class="notice-icon" aria-hidden="true">i</span>
+        <p id="notice-text">서버 상태와 안전 설정을 불러오고 있습니다.</p>
+        <button id="notice-close" class="icon-button" type="button" aria-label="알림 닫기">×</button>
+      </div>
+
+      <section class="metric-strip" aria-label="계좌 핵심 현황">
+        <article>
+          <span class="metric-index">01</span>
+          <p>운영 모드</p>
+          <strong id="metric-mode">확인 중</strong>
+          <small id="metric-broker">브로커 —</small>
+        </article>
+        <article>
+          <span class="metric-index">02</span>
+          <p>총자산</p>
+          <strong id="metric-equity">—</strong>
+          <small>모의계좌 평가액</small>
+        </article>
+        <article>
+          <span class="metric-index">03</span>
+          <p>현금</p>
+          <strong id="metric-cash">—</strong>
+          <small id="metric-cash-rate">대기자금 —</small>
+        </article>
+        <article>
+          <span class="metric-index">04</span>
+          <p>보유 종목</p>
+          <strong id="metric-positions">—</strong>
+          <small id="metric-position-rule">목표 범위 —</small>
+        </article>
+        <article>
+          <span class="metric-index">05</span>
+          <p>최근 실행</p>
+          <strong id="metric-last-run">없음</strong>
+          <small id="metric-last-result">아직 실행 전</small>
+        </article>
+      </section>
+
+      <section class="command-bar" aria-label="계획 및 모의실행 도구">
+        <div>
+          <p class="micro-label">SAFE ACTIONS ONLY</p>
+          <h2>투자 계획을 확인하고 모의계좌로 검증하세요</h2>
+          <p id="action-guidance">먼저 최신 데이터를 기준으로 주문 계획을 생성합니다.</p>
+        </div>
+        <div class="command-actions">
+          <button id="refresh-button" class="button button-ghost" type="button">
+            <span aria-hidden="true">↻</span> 상태 새로고침
+          </button>
+          <button id="plan-button" class="button button-secondary" type="button" disabled>
+            계획 생성
+          </button>
+          <button id="paper-run-button" class="button button-primary" type="button" disabled>
+            모의주문 실행
+          </button>
+        </div>
+      </section>
+
+      <div class="workspace">
+        <aside class="side-column">
+          <section class="panel mode-panel" aria-labelledby="mode-title">
+            <div class="panel-heading">
+              <div>
+                <p class="section-number">01 / SAFETY</p>
+                <h2 id="mode-title">운영 모드와 잠금</h2>
+              </div>
+              <span id="lock-state" class="lock-state">잠금 확인 중</span>
+            </div>
+
+            <ol class="mode-track" aria-label="자동매매 운영 단계">
+              <li id="mode-step-disabled">
+                <span>1</span>
+                <div><strong>비활성</strong><small>조회와 계획만 가능</small></div>
+              </li>
+              <li id="mode-step-paper">
+                <span>2</span>
+                <div><strong>모의투자</strong><small>가상 잔고로 주문 검증</small></div>
+              </li>
+              <li id="mode-step-live">
+                <span>3</span>
+                <div><strong>실전투자</strong><small>이 화면에서는 항상 실행 불가</small></div>
+              </li>
+            </ol>
+
+            <div class="safety-seal">
+              <span aria-hidden="true">✓</span>
+              <div>
+                <strong>실전 주문 UI 미제공</strong>
+                <small>오직 계획 생성과 paper-run만 호출합니다.</small>
+              </div>
+            </div>
+          </section>
+
+          <section class="panel" aria-labelledby="rules-title">
+            <div class="panel-heading">
+              <div>
+                <p class="section-number">02 / POLICY</p>
+                <h2 id="rules-title">현재 투자 원칙</h2>
+              </div>
+            </div>
+            <dl id="policy-list" class="policy-list">
+              <div><dt>대상 시장</dt><dd>한국 KOSPI · KOSDAQ</dd></div>
+              <div><dt>최소 종합점수</dt><dd>—</dd></div>
+              <div><dt>최소 신뢰도</dt><dd>—</dd></div>
+              <div><dt>목표 종목 수</dt><dd>—</dd></div>
+              <div><dt>현금 보유</dt><dd>—</dd></div>
+              <div><dt>종목당 최대</dt><dd>—</dd></div>
+              <div><dt>1회 최대 회전율</dt><dd>—</dd></div>
+            </dl>
+            <p class="policy-footnote">
+              순위만 추종하지 않고 데이터 완전성·가치평가 신뢰도·유동성 및 업종
+              분산 한도를 함께 적용합니다.
+            </p>
+          </section>
+
+          <section class="panel" aria-labelledby="signal-title">
+            <div class="panel-heading">
+              <div>
+                <p class="section-number">03 / SIGNAL</p>
+                <h2 id="signal-title">Longview 신호</h2>
+              </div>
+              <span id="signal-health" class="mini-badge neutral">대기</span>
+            </div>
+            <dl class="signal-list">
+              <div><dt>모델 버전</dt><dd id="signal-model">—</dd></div>
+              <div><dt>데이터 갱신</dt><dd id="signal-updated">—</dd></div>
+              <div><dt>후보 수</dt><dd id="signal-count">—</dd></div>
+              <div><dt>Revision</dt><dd id="signal-revision">—</dd></div>
+            </dl>
+          </section>
+        </aside>
+
+        <div class="main-column">
+          <section id="block-panel" class="panel block-panel" aria-labelledby="block-title">
+            <div class="panel-heading">
+              <div>
+                <p class="section-number">04 / RISK GATE</p>
+                <h2 id="block-title">안전 점검 결과</h2>
+              </div>
+              <span id="risk-badge" class="mini-badge neutral">계획 대기</span>
+            </div>
+            <div id="blocked-empty" class="empty-inline">
+              계획을 생성하면 주문 전 차단 사유를 여기에 표시합니다.
+            </div>
+            <ul id="blocked-list" class="blocked-list" hidden></ul>
+            <div id="risk-summary" class="risk-summary" hidden>
+              <div><span>계획 주문</span><strong id="risk-order-count">—</strong></div>
+              <div><span>예상 거래금액</span><strong id="risk-gross">—</strong></div>
+              <div><span>자산 대비 회전율</span><strong id="risk-turnover">—</strong></div>
+              <div><span>주문 후 예상 잔액</span><strong id="risk-cash-after">—</strong></div>
+            </div>
+          </section>
+
+          <section class="panel table-panel" aria-labelledby="portfolio-title">
+            <div class="panel-heading table-heading">
+              <div>
+                <p class="section-number">05 / ALLOCATION</p>
+                <h2 id="portfolio-title">선택 종목과 목표 비중</h2>
+              </div>
+              <span id="portfolio-count" class="count-label">0개 종목</span>
+            </div>
+            <div class="table-scroll">
+              <table>
+                <thead>
+                  <tr>
+                    <th scope="col">순위</th>
+                    <th scope="col">기업 / 종목코드</th>
+                    <th scope="col">시장·업종</th>
+                    <th scope="col" class="number">Longview 점수</th>
+                    <th scope="col" class="number">현재 비중</th>
+                    <th scope="col" class="number">목표 비중</th>
+                    <th scope="col">비중 시각화</th>
+                  </tr>
+                </thead>
+                <tbody id="portfolio-body">
+                  <tr class="empty-row"><td colspan="7">아직 생성된 투자 계획이 없습니다.</td></tr>
+                </tbody>
+              </table>
+            </div>
+          </section>
+
+          <section class="panel table-panel" aria-labelledby="orders-title">
+            <div class="panel-heading table-heading">
+              <div>
+                <p class="section-number">06 / ORDER PLAN</p>
+                <h2 id="orders-title">주문 계획</h2>
+              </div>
+              <span id="orders-count" class="count-label">0건</span>
+            </div>
+            <div class="table-scroll">
+              <table>
+                <thead>
+                  <tr>
+                    <th scope="col">구분</th>
+                    <th scope="col">기업 / 종목코드</th>
+                    <th scope="col">주문 방식</th>
+                    <th scope="col" class="number">수량</th>
+                    <th scope="col" class="number">지정가</th>
+                    <th scope="col" class="number">예상 금액</th>
+                    <th scope="col">계획 사유</th>
+                  </tr>
+                </thead>
+                <tbody id="orders-body">
+                  <tr class="empty-row"><td colspan="7">계획 생성 후 주문 후보가 표시됩니다.</td></tr>
+                </tbody>
+              </table>
+            </div>
+          </section>
+
+          <section class="panel table-panel" aria-labelledby="results-title">
+            <div class="panel-heading table-heading">
+              <div>
+                <p class="section-number">07 / PAPER EXECUTION</p>
+                <h2 id="results-title">최근 모의실행 결과</h2>
+              </div>
+              <span id="results-time" class="count-label">실행 기록 없음</span>
+            </div>
+            <div class="table-scroll">
+              <table>
+                <thead>
+                  <tr>
+                    <th scope="col">결과</th>
+                    <th scope="col">기업 / 종목코드</th>
+                    <th scope="col">구분</th>
+                    <th scope="col" class="number">체결 수량</th>
+                    <th scope="col" class="number">체결 가격</th>
+                    <th scope="col" class="number">모의 수수료</th>
+                    <th scope="col">메시지</th>
+                  </tr>
+                </thead>
+                <tbody id="results-body">
+                  <tr class="empty-row"><td colspan="7">모의주문을 실행하면 결과가 표시됩니다.</td></tr>
+                </tbody>
+              </table>
+            </div>
+          </section>
+        </div>
+      </div>
+    </main>
+
+    <footer>
+      <p><strong>LONGVIEW AUTO</strong> · 모의투자 안전 대시보드</p>
+      <p>이 화면은 투자자문이나 수익 보장이 아니며, 실전 주문을 실행하지 않습니다.</p>
+    </footer>
+
+    <div id="busy-overlay" class="busy-overlay" hidden aria-live="assertive" aria-busy="true">
+      <div class="busy-card">
+        <span class="spinner" aria-hidden="true"></span>
+        <strong id="busy-title">처리 중</strong>
+        <p id="busy-message">잠시만 기다려 주세요.</p>
+      </div>
+    </div>
+  </body>
+</html>
