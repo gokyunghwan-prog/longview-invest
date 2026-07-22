@@ -507,7 +507,10 @@ export class TradingEngine {
       quotes: executionQuotes.quotes,
       totalEquityKrw: account.totalEquityKrw,
       config: this.config,
-      now,
+      // Live quotes are observed after the plan-start timestamp. Evaluate
+      // freshness against a clock sampled after all broker reads so a quote
+      // cannot look artificially "from the future" by a few seconds.
+      now: this.now(),
       incumbents: account.positions
     };
     const portfolio = this.config.longview.requirePublishedSelection
