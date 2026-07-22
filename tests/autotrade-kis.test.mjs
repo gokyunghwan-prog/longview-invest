@@ -229,6 +229,17 @@ test("getQuotes는 공식 국내 현재가 API를 호출하고 주문용 최신 
   const fetchImpl = async (url, options) => {
     calls.push({ url, options });
     if (url.endsWith("/oauth2/tokenP")) return tokenResponse("quote-token");
+    if (url.includes("/inquire-daily-price")) {
+      return jsonResponse({
+        rt_cd: "0",
+        msg_cd: "MCA00000",
+        msg1: "정상",
+        output: [
+          { stck_bsop_date: "20260718", stck_clpr: "69,500" },
+          { stck_bsop_date: "20260719", stck_clpr: "70,100" }
+        ]
+      });
+    }
     return jsonResponse({
       rt_cd: "0",
       msg_cd: "MCA00000",
@@ -238,9 +249,7 @@ test("getQuotes는 공식 국내 현재가 API를 호출하고 주문용 최신 
         stck_sdpr: "69,500",
         prdy_vrss: "600",
         prdy_ctrt: "0.86",
-        acml_vol: "12,345,678",
-        stck_bsop_date: "20260719",
-        stck_cntg_hour: "163000"
+        acml_vol: "12,345,678"
       }
     });
   };
@@ -274,10 +283,34 @@ test("getQuotes는 공식 국내 현재가 API를 호출하고 주문용 최신 
   assert.equal(quotes[0].marketDate, "20260719");
 
   const quoteCalls = calls.slice(1);
-  assert.equal(quoteCalls.length, 1);
+  assert.equal(quoteCalls.length, 2);
   assert.equal(quoteCalls[0].options.headers.tr_id, "FHKST01010100");
   assert.match(quoteCalls[0].url, /FID_COND_MRKT_DIV_CODE=J/);
   assert.match(quoteCalls[0].url, /FID_INPUT_ISCD=005930/);
+  assert.equal(quoteCalls[1].options.headers.tr_id, "FHKST01010400");
+  assert.match(quoteCalls[1].url, /inquire-daily-price/);
+  assert.match(quoteCalls[1].url, /FID_PERIOD_DIV_CODE=D/);
+  assert.match(quoteCalls[1].url, /FID_ORG_ADJ_PRC=1/);
+});
+
+test("getQuotes는 공식 일자별 시세에서 영업일을 확인하지 못하면 fail-closed한다", async () => {
+  const fetchImpl = async (url) => {
+    if (url.endsWith("/oauth2/tokenP")) return tokenResponse("quote-token");
+    if (url.includes("/inquire-daily-price")) {
+      return jsonResponse({ rt_cd: "0", output: [] });
+    }
+    return jsonResponse({ rt_cd: "0", output: { stck_prpr: "70100" } });
+  };
+  const broker = new KisBroker(CONFIG, {
+    fetchImpl,
+    minimumIntervalMs: 0,
+    now: () => Date.UTC(2026, 6, 19, 7, 30, 0)
+  });
+
+  await assert.rejects(
+    broker.getQuotes([{ ticker: "005930", country: "KR", exchange: "KOSPI" }]),
+    (error) => error?.code === "KIS_QUOTE_MARKET_DATE_MISSING"
+  );
 });
 
 test("시장가 주문은 토큰이나 주문 API를 부르기 전에 거절한다", async () => {
