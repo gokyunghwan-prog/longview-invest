@@ -1,12 +1,15 @@
 const DEFAULT_PRODUCTION_URL = "https://openapi.koreainvestment.com:9443";
 const DEFAULT_VIRTUAL_URL = "https://openapivts.koreainvestment.com:29443";
-const DEFAULT_MINIMUM_INTERVAL_MS = 500;
+const DEFAULT_MINIMUM_INTERVAL_MS = 1_100;
 const DEFAULT_REQUEST_TIMEOUT_MS = 15_000;
 const DEFAULT_MAX_RESPONSE_BYTES = 2 * 1024 * 1024;
 const DEFAULT_MAX_BALANCE_PAGES = 10;
 const DEFAULT_MAX_BALANCE_ROWS = 5_000;
+const DEFAULT_READ_RATE_LIMIT_RETRIES = 3;
+const DEFAULT_READ_RATE_LIMIT_BACKOFF_MS = 2_000;
 const MAX_DAILY_ORDER_QUERY_CALENDAR_DAYS = 7;
 const TOKEN_EXPIRY_SKEW_MS = 60_000;
+const RATE_LIMIT_ERROR_CODES = new Set(["EGW00201"]);
 
 const DOMESTIC_BALANCE_PATH = "/uapi/domestic-stock/v1/trading/inquire-balance";
 const DOMESTIC_ORDER_PATH = "/uapi/domestic-stock/v1/trading/order-cash";
@@ -472,6 +475,8 @@ export class KisBroker {
       maxResponseBytes = DEFAULT_MAX_RESPONSE_BYTES,
       maximumBalancePages = DEFAULT_MAX_BALANCE_PAGES,
       maximumBalanceRows = DEFAULT_MAX_BALANCE_ROWS,
+      readRateLimitRetries = DEFAULT_READ_RATE_LIMIT_RETRIES,
+      readRateLimitBackoffMs = DEFAULT_READ_RATE_LIMIT_BACKOFF_MS,
       tokenExpirySkewMs = TOKEN_EXPIRY_SKEW_MS
     } = {}
   ) {
@@ -504,6 +509,12 @@ export class KisBroker {
     if (!Number.isSafeInteger(maximumBalanceRows) || maximumBalanceRows <= 0) {
       throw new TypeError("KIS 잔고 최대 행 수는 1 이상의 정수여야 합니다.");
     }
+    if (!Number.isSafeInteger(readRateLimitRetries) || readRateLimitRetries < 0) {
+      throw new TypeError("KIS 읽기 재시도 횟수는 0 이상의 정수여야 합니다.");
+    }
+    if (!Number.isFinite(readRateLimitBackoffMs) || readRateLimitBackoffMs <= 0) {
+      throw new TypeError("KIS 읽기 재시도 대기시간은 0보다 커야 합니다.");
+    }
     if (typeof AbortController !== "function") {
       throw new Error("KIS 요청 제한시간을 적용하려면 AbortController가 필요합니다.");
     }
@@ -527,6 +538,8 @@ export class KisBroker {
     this.maxResponseBytes = maxResponseBytes;
     this.maximumBalancePages = maximumBalancePages;
     this.maximumBalanceRows = maximumBalanceRows;
+    this.readRateLimitRetries = readRateLimitRetries;
+    this.readRateLimitBackoffMs = readRateLimitBackoffMs;
     this.tokenExpirySkewMs = Math.max(0, finiteNumber(tokenExpirySkewMs));
 
     this.accessToken = "";
@@ -786,6 +799,23 @@ export class KisBroker {
     };
   }
 
+  async _readRequest(path, options) {
+    for (let attempt = 0; ; attempt += 1) {
+      try {
+        return await this._request(path, {
+          ...options,
+          method: "GET",
+          order: false
+        });
+      } catch (error) {
+        const retryable =
+          error instanceof KisApiError && RATE_LIMIT_ERROR_CODES.has(cleanText(error.code));
+        if (!retryable || attempt >= this.readRateLimitRetries) throw error;
+        await this.sleep(this.readRateLimitBackoffMs * 2 ** attempt);
+      }
+    }
+  }
+
   async _getPagedRows({
     path,
     trId,
@@ -806,7 +836,7 @@ export class KisBroker {
     let nk = "";
 
     for (let page = 1; page <= this.maximumBalancePages; page += 1) {
-      const { body, trCont } = await this._request(path, {
+      const { body, trCont } = await this._readRequest(path, {
         trId,
         query: { ...query, [fkName]: fk, [nkName]: nk },
         trCont: page === 1 ? "" : "N",
@@ -861,7 +891,7 @@ export class KisBroker {
     }
     const ticker = validateTicker(instrument);
     const marketCode = domesticQuoteMarket(instrument);
-    const payload = await this._request(DOMESTIC_QUOTE_PATH, {
+    const payload = await this._readRequest(DOMESTIC_QUOTE_PATH, {
       trId: "FHKST01010100",
       query: {
         FID_COND_MRKT_DIV_CODE: marketCode,
@@ -878,7 +908,7 @@ export class KisBroker {
     // The official inquire-price response does not include a business date.
     // Confirm it independently with the official daily-price endpoint instead
     // of treating the runner clock as proof that the quote belongs to today.
-    const dailyPayload = await this._request(DOMESTIC_DAILY_PRICE_PATH, {
+    const dailyPayload = await this._readRequest(DOMESTIC_DAILY_PRICE_PATH, {
       trId: "FHKST01010400",
       query: {
         FID_COND_MRKT_DIV_CODE: marketCode,
@@ -941,7 +971,7 @@ export class KisBroker {
       order.quantity === undefined || order.quantity === null
         ? null
         : Number(positiveInteger(order.quantity, "조회 주문수량"));
-    const payload = await this._request(DOMESTIC_BUYABLE_PATH, {
+    const payload = await this._readRequest(DOMESTIC_BUYABLE_PATH, {
       trId: this.environment === "prod" ? "TTTC8908R" : "VTTC8908R",
       query: {
         CANO: this.accountNumber,
