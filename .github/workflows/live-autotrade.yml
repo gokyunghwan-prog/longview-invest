@@ -1,0 +1,187 @@
+name: Encrypted Korean live autotrade
+
+on:
+  schedule:
+    # GitHub cron is UTC: 00:23 UTC = 09:23 KST on weekdays.
+    - cron: "23 0 * * 1-5"
+    # 06:13 UTC = 15:13 KST. Reconcile and cancel remaining open orders.
+    - cron: "13 6 * * 1-5"
+  workflow_dispatch:
+    inputs:
+      operation:
+        description: "Safe default is plan (no order submission)"
+        required: true
+        type: choice
+        default: plan
+        options:
+          - plan
+          - trade
+          - reconcile
+      confirm_live:
+        description: "Required for manual trade/reconcile; ignored by plan"
+        required: true
+        type: boolean
+        default: false
+
+concurrency:
+  group: encrypted-korean-live-autotrade
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  cloud-autotrade:
+    # The workflow is committed disabled: schedules remain skipped until the
+    # owner deliberately creates AUTOTRADE_LIVE_ENABLED=true. Manual plan is
+    # still available for a no-order end-to-end validation.
+    if: github.event_name == 'workflow_dispatch' || vars.AUTOTRADE_LIVE_ENABLED == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      LONGVIEW_BASE_URL: http://127.0.0.1:4173
+      TRADING_MODE: live
+      TRADING_BROKER: kis
+      KIS_ENV: prod
+      TRADING_REBALANCE_FREQUENCY: daily
+      TRADING_MIN_POSITIONS: "3"
+      TRADING_MAX_POSITIONS: "5"
+      TRADING_CASH_RESERVE_PERCENT: "0"
+      TRADING_MAX_POSITION_PERCENT: "35"
+      TRADING_MAX_SECTOR_PERCENT: "35"
+      TRADING_MIN_POSITION_KRW: "20000"
+      TRADING_MIN_ORDER_KRW: "5000"
+      TRADING_CAPITAL_LIMIT_KRW: "0"
+      TRADING_USE_ALL_DEDICATED_ACCOUNT_ASSETS: "true"
+      TRADING_INITIAL_DEPLOYMENT_TURNOVER_PERCENT: "100"
+      TRADING_MAX_TURNOVER_PERCENT: "20"
+      TRADING_MAX_ORDERS_PER_RUN: "10"
+      TRADING_REBALANCE_DRIFT_PERCENT: "3"
+      TRADING_REMOVAL_CONFIRMATIONS: "2"
+      TRADING_REPLACEMENT_SCORE_LEAD: "3"
+      TRADING_REQUIRE_DEDICATED_ACCOUNT: "true"
+      TRADING_REQUIRE_PUBLISHED_SELECTION: "true"
+      TRADING_AUTORUN_ENABLED: "true"
+      ENABLE_LIVE_TRADING: "true"
+      ENABLE_UNATTENDED_LIVE_TRADING: "true"
+      AUTOTRADE_CLOUD_LEASE_MS: "1200000"
+
+    steps:
+      - name: Check out the default branch without persisted credentials
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: "22"
+
+      - name: Reject an unconfirmed manual live operation
+        if: github.event_name == 'workflow_dispatch' && inputs.operation != 'plan' && (inputs.confirm_live != true || vars.AUTOTRADE_LIVE_ENABLED != 'true')
+        run: |
+          echo "Manual trade/reconcile requires confirm_live and AUTOTRADE_LIVE_ENABLED=true."
+          exit 1
+
+      - name: Validate the runner and its safety contracts
+        run: |
+          node --check scripts/cloud-autotrade.mjs
+          node --test tests/autotrade-cloud-state.test.mjs tests/autotrade-cloud-runner.test.mjs tests/autotrade-kis.test.mjs tests/autotrade-reconciliation.test.mjs
+
+      - name: Start the read-only Longview ranking API
+        run: |
+          node server.mjs > "$RUNNER_TEMP/longview-server.log" 2>&1 &
+          echo $! > "$RUNNER_TEMP/longview-server.pid"
+          for attempt in $(seq 1 30); do
+            if curl --fail --silent http://127.0.0.1:4173/api/health > /dev/null; then
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "Longview ranking API did not become ready."
+          exit 1
+
+      - name: Manual safe plan (no orders)
+        if: github.event_name == 'workflow_dispatch' && inputs.operation == 'plan'
+        run: node scripts/cloud-autotrade.mjs plan
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          AUTOTRADE_STATE_KEY: ${{ secrets.AUTOTRADE_STATE_KEY }}
+          KIS_APP_KEY: ${{ secrets.KIS_APP_KEY }}
+          KIS_APP_SECRET: ${{ secrets.KIS_APP_SECRET }}
+          KIS_ACCOUNT_NUMBER: ${{ secrets.KIS_ACCOUNT_NUMBER }}
+          KIS_ACCOUNT_PRODUCT_CODE: ${{ secrets.KIS_ACCOUNT_PRODUCT_CODE }}
+          KIS_HTS_ID: ${{ secrets.KIS_HTS_ID }}
+          LIVE_TRADING_ACK: ${{ secrets.LIVE_TRADING_ACK }}
+          USE_ALL_DEDICATED_ACCOUNT_ASSETS_ACK: ${{ secrets.USE_ALL_DEDICATED_ACCOUNT_ASSETS_ACK }}
+          UNATTENDED_LIVE_TRADING_ACK: ${{ secrets.UNATTENDED_LIVE_TRADING_ACK }}
+          CLOUD_LIVE_TRADING_ACK: ${{ secrets.CLOUD_LIVE_TRADING_ACK }}
+          CLOUD_MANUAL_LIVE_CONFIRM: "false"
+
+      - name: Scheduled morning trade
+        if: github.event_name == 'schedule' && github.event.schedule == '23 0 * * 1-5'
+        run: node scripts/cloud-autotrade.mjs trade
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          AUTOTRADE_STATE_KEY: ${{ secrets.AUTOTRADE_STATE_KEY }}
+          KIS_APP_KEY: ${{ secrets.KIS_APP_KEY }}
+          KIS_APP_SECRET: ${{ secrets.KIS_APP_SECRET }}
+          KIS_ACCOUNT_NUMBER: ${{ secrets.KIS_ACCOUNT_NUMBER }}
+          KIS_ACCOUNT_PRODUCT_CODE: ${{ secrets.KIS_ACCOUNT_PRODUCT_CODE }}
+          KIS_HTS_ID: ${{ secrets.KIS_HTS_ID }}
+          LIVE_TRADING_ACK: ${{ secrets.LIVE_TRADING_ACK }}
+          USE_ALL_DEDICATED_ACCOUNT_ASSETS_ACK: ${{ secrets.USE_ALL_DEDICATED_ACCOUNT_ASSETS_ACK }}
+          UNATTENDED_LIVE_TRADING_ACK: ${{ secrets.UNATTENDED_LIVE_TRADING_ACK }}
+          CLOUD_LIVE_TRADING_ACK: ${{ secrets.CLOUD_LIVE_TRADING_ACK }}
+          CLOUD_EVENT_SCHEDULE: "23 0 * * 1-5"
+
+      - name: Scheduled afternoon reconciliation
+        if: github.event_name == 'schedule' && github.event.schedule == '13 6 * * 1-5'
+        run: node scripts/cloud-autotrade.mjs reconcile
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          AUTOTRADE_STATE_KEY: ${{ secrets.AUTOTRADE_STATE_KEY }}
+          KIS_APP_KEY: ${{ secrets.KIS_APP_KEY }}
+          KIS_APP_SECRET: ${{ secrets.KIS_APP_SECRET }}
+          KIS_ACCOUNT_NUMBER: ${{ secrets.KIS_ACCOUNT_NUMBER }}
+          KIS_ACCOUNT_PRODUCT_CODE: ${{ secrets.KIS_ACCOUNT_PRODUCT_CODE }}
+          KIS_HTS_ID: ${{ secrets.KIS_HTS_ID }}
+          LIVE_TRADING_ACK: ${{ secrets.LIVE_TRADING_ACK }}
+          USE_ALL_DEDICATED_ACCOUNT_ASSETS_ACK: ${{ secrets.USE_ALL_DEDICATED_ACCOUNT_ASSETS_ACK }}
+          UNATTENDED_LIVE_TRADING_ACK: ${{ secrets.UNATTENDED_LIVE_TRADING_ACK }}
+          CLOUD_LIVE_TRADING_ACK: ${{ secrets.CLOUD_LIVE_TRADING_ACK }}
+          CLOUD_EVENT_SCHEDULE: "13 6 * * 1-5"
+
+      - name: Confirmed manual trade
+        if: github.event_name == 'workflow_dispatch' && inputs.operation == 'trade' && inputs.confirm_live == true && vars.AUTOTRADE_LIVE_ENABLED == 'true'
+        run: node scripts/cloud-autotrade.mjs trade
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          AUTOTRADE_STATE_KEY: ${{ secrets.AUTOTRADE_STATE_KEY }}
+          KIS_APP_KEY: ${{ secrets.KIS_APP_KEY }}
+          KIS_APP_SECRET: ${{ secrets.KIS_APP_SECRET }}
+          KIS_ACCOUNT_NUMBER: ${{ secrets.KIS_ACCOUNT_NUMBER }}
+          KIS_ACCOUNT_PRODUCT_CODE: ${{ secrets.KIS_ACCOUNT_PRODUCT_CODE }}
+          KIS_HTS_ID: ${{ secrets.KIS_HTS_ID }}
+          LIVE_TRADING_ACK: ${{ secrets.LIVE_TRADING_ACK }}
+          USE_ALL_DEDICATED_ACCOUNT_ASSETS_ACK: ${{ secrets.USE_ALL_DEDICATED_ACCOUNT_ASSETS_ACK }}
+          UNATTENDED_LIVE_TRADING_ACK: ${{ secrets.UNATTENDED_LIVE_TRADING_ACK }}
+          CLOUD_LIVE_TRADING_ACK: ${{ secrets.CLOUD_LIVE_TRADING_ACK }}
+          CLOUD_MANUAL_LIVE_CONFIRM: "true"
+
+      - name: Confirmed manual reconciliation
+        if: github.event_name == 'workflow_dispatch' && inputs.operation == 'reconcile' && inputs.confirm_live == true && vars.AUTOTRADE_LIVE_ENABLED == 'true'
+        run: node scripts/cloud-autotrade.mjs reconcile
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          AUTOTRADE_STATE_KEY: ${{ secrets.AUTOTRADE_STATE_KEY }}
+          KIS_APP_KEY: ${{ secrets.KIS_APP_KEY }}
+          KIS_APP_SECRET: ${{ secrets.KIS_APP_SECRET }}
+          KIS_ACCOUNT_NUMBER: ${{ secrets.KIS_ACCOUNT_NUMBER }}
+          KIS_ACCOUNT_PRODUCT_CODE: ${{ secrets.KIS_ACCOUNT_PRODUCT_CODE }}
+          KIS_HTS_ID: ${{ secrets.KIS_HTS_ID }}
+          LIVE_TRADING_ACK: ${{ secrets.LIVE_TRADING_ACK }}
+          USE_ALL_DEDICATED_ACCOUNT_ASSETS_ACK: ${{ secrets.USE_ALL_DEDICATED_ACCOUNT_ASSETS_ACK }}
+          UNATTENDED_LIVE_TRADING_ACK: ${{ secrets.UNATTENDED_LIVE_TRADING_ACK }}
+          CLOUD_LIVE_TRADING_ACK: ${{ secrets.CLOUD_LIVE_TRADING_ACK }}
+          CLOUD_MANUAL_LIVE_CONFIRM: "true"

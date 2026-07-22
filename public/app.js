@@ -2,6 +2,7 @@ const state = {
   overview: null,
   companies: [],
   methodology: null,
+  investmentSelection: null,
   pagination: {
     page: 1,
     pageSize: 25,
@@ -18,9 +19,8 @@ const state = {
   detailCache: new Map(),
   filters: {
     query: "",
-    country: "ALL",
     sector: "ALL",
-    sort: "score",
+    sort: "investment",
     candidateOnly: false
   }
 };
@@ -32,7 +32,6 @@ const elements = {
   sectorSelect: document.querySelector("#sector-select"),
   sortSelect: document.querySelector("#sort-select"),
   candidateOnly: document.querySelector("#candidate-only"),
-  countryTabs: [...document.querySelectorAll("[data-country]")],
   companyDialog: document.querySelector("#company-dialog"),
   companyDialogContent: document.querySelector("#company-dialog-content"),
   methodDialog: document.querySelector("#method-dialog"),
@@ -125,7 +124,7 @@ function formatPrice(value, currency) {
   try {
     return new Intl.NumberFormat("ko-KR", {
       style: "currency",
-      currency: currency || "USD",
+      currency: currency || "KRW",
       currencyDisplay: "narrowSymbol",
       maximumFractionDigits: currency === "KRW" ? 0 : 2
     }).format(value);
@@ -195,9 +194,7 @@ function barClass(score) {
   return "low";
 }
 
-function countryLabel(country) {
-  return country === "KR" ? "KR · 한국" : "US · 미국";
-}
+const KOREAN_MARKET_LABEL = "KR · 한국";
 
 function evaluationStatus(company) {
   const modelStatus =
@@ -331,19 +328,6 @@ function componentBars(company) {
     .join("");
 }
 
-function renderCountryFacets(facets = {}) {
-  const counts = new Map(
-    (facets.countries || []).map((item) => [item.value, Number(item.count) || 0])
-  );
-  const labels = { ALL: "전체", KR: "한국", US: "미국" };
-  for (const button of elements.countryTabs) {
-    const country = button.dataset.country;
-    const count = counts.get(country);
-    button.textContent =
-      labels[country] + (Number.isFinite(count) ? " " + count.toLocaleString("ko-KR") : "");
-  }
-}
-
 function sparkBars(company) {
   const history = company.history || [];
   if (history.length === 0) {
@@ -385,6 +369,14 @@ function companyCard(company, visibleRank) {
   const reason =
     company.reasons?.[0] || "구조화된 공시 데이터에서 평가 근거를 생성하지 못했습니다.";
   const candidate = company.score.candidate;
+  const investmentSelection = company.investmentSelection || null;
+  const investmentBadge = investmentSelection
+    ? '<span class="investment-selection-badge">자동투자 목표 ' +
+      (Number(investmentSelection.targetWeight || 0) * 100).toFixed(1) +
+      '% · 10만원 주식단위 참고 ' +
+      (Number(investmentSelection.referenceAllocationWeight || 0) * 100).toFixed(1) +
+      "%</span>"
+    : "";
   const analysisStatus = evaluationStatus(company);
   const evaluationHeld = isEvaluationHeld(company);
   const scoreForRing = evaluationHeld ? 0 : score;
@@ -411,8 +403,9 @@ function companyCard(company, visibleRank) {
     String(visibleRank).padStart(2, "0") +
     "</strong></div>" +
     '<div class="company-primary">' +
+    investmentBadge +
     '<div class="company-meta"><span class="country-badge">' +
-    countryLabel(company.country) +
+    KOREAN_MARKET_LABEL +
     "</span><span>" +
     escapeHtml(company.exchange) +
     "</span><span>·</span><span>" +
@@ -553,7 +546,6 @@ function renderPagination() {
 function companyQuery() {
   const parameters = new URLSearchParams({
     q: state.filters.query.trim(),
-    country: state.filters.country,
     sector: state.filters.sector,
     sort: state.filters.sort,
     candidateOnly: String(state.filters.candidateOnly),
@@ -561,6 +553,93 @@ function companyQuery() {
     pageSize: String(state.pagination.pageSize)
   });
   return parameters;
+}
+
+function normalizedSearch(value) {
+  return String(value || "")
+    .normalize("NFKC")
+    .toLocaleLowerCase("ko")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function renderInvestmentSelectionNote(artifact = null) {
+  const note = document.querySelector("#investment-selection-note");
+  if (!note) return;
+  if (state.filters.sort !== "investment" || !artifact) {
+    note.hidden = true;
+    return;
+  }
+  const summary = artifact.summary || {};
+  const generatedAt = artifact.generatedAt
+    ? new Date(artifact.generatedAt).toLocaleString("ko-KR", { timeZone: "Asia/Seoul" })
+    : "—";
+  note.hidden = false;
+  note.innerHTML =
+    '<div><strong>오늘의 자동투자 선정 ' +
+    Number(summary.selected || 0).toLocaleString("ko-KR") +
+    "개</strong><span>10만원 참조 · 목표 현금 0% · 종목/업종 최대 35%</span></div>" +
+    '<p>정수 주식 단위 참고 투자액 ' +
+    Number(summary.referenceInvestedKrw || 0).toLocaleString("ko-KR") +
+    "원 · 불가피한 참고 잔액 " +
+    Number(summary.projectedReferenceCashKrw || 0).toLocaleString("ko-KR") +
+    "원 · 생성 " +
+    escapeHtml(generatedAt) +
+    "</p>";
+}
+
+async function loadInvestmentCompanies(controller) {
+  const selectionResponse = await fetch("/api/investment-selection", {
+    cache: "no-cache",
+    signal: controller.signal
+  });
+  if (!selectionResponse.ok) {
+    const payload = await selectionResponse.json().catch(() => ({}));
+    throw new Error(payload.error || "자동투자 선정 목록을 불러오지 못했습니다.");
+  }
+  const artifact = await selectionResponse.json();
+  const selected = Array.isArray(artifact.selected) ? artifact.selected : [];
+  const companies = await Promise.all(
+    selected.map(async (selection, index) => {
+      let company = state.detailCache.get(selection.id);
+      if (!company) {
+        const response = await fetch("/api/companies/" + encodeURIComponent(selection.id), {
+          cache: "no-cache",
+          signal: controller.signal
+        });
+        if (!response.ok) throw new Error("선정 기업 상세정보가 현재 데이터와 일치하지 않습니다.");
+        company = await response.json();
+        state.detailCache.set(selection.id, company);
+      }
+      return {
+        ...company,
+        position: index + 1,
+        investmentSelection: selection
+      };
+    })
+  );
+  const query = normalizedSearch(state.filters.query);
+  const filtered = companies.filter((company) => {
+    if (state.filters.sector !== "ALL" && company.sector !== state.filters.sector) return false;
+    if (!query) return true;
+    return normalizedSearch(
+      [company.name, company.nameEn, company.ticker, company.sector].filter(Boolean).join(" ")
+    ).includes(query);
+  });
+  state.investmentSelection = artifact;
+  renderInvestmentSelectionNote(artifact);
+  return {
+    revision: artifact.sourceRevision,
+    items: filtered,
+    pagination: {
+      page: 1,
+      pageSize: Math.max(1, filtered.length),
+      total: filtered.length,
+      totalPages: filtered.length ? 1 : 0,
+      hasPrevious: false,
+      hasNext: false
+    }
+  };
 }
 
 function renderListLoading() {
@@ -580,15 +659,21 @@ async function loadCompanies({ resetPage = false } = {}) {
   renderListLoading();
 
   try {
-    const response = await fetch("/api/companies?" + companyQuery(), {
-      cache: "no-cache",
-      signal: controller.signal
-    });
-    if (!response.ok) throw new Error("회사 목록을 불러오지 못했습니다.");
-    const payload = await response.json();
+    let payload;
+    if (state.filters.sort === "investment") {
+      payload = await loadInvestmentCompanies(controller);
+    } else {
+      renderInvestmentSelectionNote(null);
+      const response = await fetch("/api/companies?" + companyQuery(), {
+        cache: "no-cache",
+        signal: controller.signal
+      });
+      if (!response.ok) throw new Error("회사 목록을 불러오지 못했습니다.");
+      payload = await response.json();
+    }
     if (sequence !== state.listSequence) return;
 
-    const revision = payload.revision || response.headers.get("etag");
+    const revision = payload.revision || null;
     if (state.revision && revision && revision !== state.revision) state.detailCache.clear();
     if (revision) state.revision = revision;
     state.companies = payload.items || payload.companies || [];
@@ -772,7 +857,7 @@ function renderCompanyDetail(company) {
   elements.companyDialogContent.innerHTML =
     '<section class="detail-hero">' +
     '<div class="company-meta"><span class="country-badge">' +
-    countryLabel(company.country) +
+    KOREAN_MARKET_LABEL +
     "</span><span>" +
     escapeHtml(company.exchange) +
     "</span><span>·</span><span>" +
@@ -826,7 +911,7 @@ function renderCompanyDetail(company) {
         "</ul></section>"
       : "") +
     '<div class="lineage-card"><span>원문 추적 정보</span><strong>' +
-    escapeHtml(company.lineage?.provider || (company.country === "KR" ? "Open DART" : "SEC EDGAR")) +
+    escapeHtml(company.lineage?.provider || "Open DART") +
     "</strong><span>Filing ID</span><strong>" +
     escapeHtml(company.lineage?.filingId || "데모 데이터 · 없음") +
     '</strong><a href="' +
@@ -928,19 +1013,15 @@ function bindEvents() {
   });
   elements.sortSelect.addEventListener("change", (event) => {
     state.filters.sort = event.target.value;
+    const investmentMode = state.filters.sort === "investment";
+    elements.candidateOnly.disabled = investmentMode;
+    elements.candidateOnly.closest(".candidate-toggle")?.classList.toggle("disabled", investmentMode);
     applyFilter();
   });
   elements.candidateOnly.addEventListener("change", (event) => {
     state.filters.candidateOnly = event.target.checked;
     applyFilter();
   });
-  for (const button of elements.countryTabs) {
-    button.addEventListener("click", () => {
-      state.filters.country = button.dataset.country;
-      elements.countryTabs.forEach((item) => item.classList.toggle("active", item === button));
-      applyFilter();
-    });
-  }
   elements.companyList.addEventListener("click", (event) => {
     const button = event.target.closest("[data-open-company]");
     if (button) showCompanyDetail(button.dataset.openCompany);
@@ -1020,7 +1101,6 @@ async function initialize() {
     renderMeta(state.overview.meta || {});
     renderSummary(state.overview.summary || {});
     populateSectors(state.overview.facets || {});
-    renderCountryFacets(state.overview.facets || {});
     await loadCompanies();
     startRevisionPolling();
   } catch (error) {
@@ -1039,16 +1119,19 @@ async function refreshOverviewIfChanged() {
     const response = await fetch("/api/overview", { cache: "no-cache" });
     if (!response.ok) return;
     const overview = await response.json();
-    if (!overview.revision || overview.revision === state.revision) return;
-    state.overview = overview;
-    state.revision = overview.revision;
-    state.detailCache.clear();
-    renderMeta(overview.meta || {});
-    renderSummary(overview.summary || {});
-    populateSectors(overview.facets || {});
-    renderCountryFacets(overview.facets || {});
+    if (!overview.revision) return;
+    const overviewChanged = overview.revision !== state.revision;
+    if (!overviewChanged && state.filters.sort !== "investment") return;
+    if (overviewChanged) {
+      state.overview = overview;
+      state.revision = overview.revision;
+      state.detailCache.clear();
+      renderMeta(overview.meta || {});
+      renderSummary(overview.summary || {});
+      populateSectors(overview.facets || {});
+    }
     await loadCompanies();
-    showToast("오늘의 공시·시세 데이터로 자동 갱신했습니다.");
+    if (overviewChanged) showToast("오늘의 공시·시세 데이터로 자동 갱신했습니다.");
   } catch {
     // The next poll retries; a transient polling failure must not replace the current screen.
   }

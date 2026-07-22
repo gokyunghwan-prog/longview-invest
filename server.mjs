@@ -9,6 +9,11 @@ import {
   createCompanyStore,
   parseCompanyQuery
 } from "./lib/company-store.mjs";
+import { validatePublicInvestmentSelection } from "./lib/investment-selection.mjs";
+import {
+  prepareRuntimeInvestmentSelection,
+  refreshRemoteInvestmentSelection
+} from "./lib/remote-investment-selection.mjs";
 import { SCORING_MODEL_VERSION, getScoringModel } from "./lib/scoring.mjs";
 import {
   prepareRuntimeSnapshot,
@@ -131,7 +136,9 @@ export async function createLongviewApp(
     storeOptions = undefined,
     syncRunner = syncAll,
     runtimeSnapshotPreparer = prepareRuntimeSnapshot,
-    remoteSnapshotRefresher = refreshRemoteFullSnapshot
+    remoteSnapshotRefresher = refreshRemoteFullSnapshot,
+    runtimeSelectionPreparer = prepareRuntimeInvestmentSelection,
+    remoteSelectionRefresher = refreshRemoteInvestmentSelection
   } = {}
 ) {
   const remoteMode = Boolean(config.remoteSnapshotUrl && !companyStore);
@@ -140,6 +147,13 @@ export async function createLongviewApp(
     : null;
   const store = companyStore ||
     (await createCompanyStore(preparedRuntime?.dataFile || config.dataFile, storeOptions));
+  const preparedSelection =
+    remoteMode && config.remoteInvestmentSelectionUrl
+      ? await runtimeSelectionPreparer(config)
+      : null;
+  const investmentSelectionFile = preparedSelection?.file ||
+    config.investmentSelectionFile ||
+    path.join(path.dirname(config.dataFile), "trading-selection.json");
   let activeSync = null;
   let activeRemoteRefresh = null;
   let lastScheduledDate = null;
@@ -180,6 +194,16 @@ export async function createLongviewApp(
         }
         if (result.etag) remoteEtag = result.etag;
         if (result.changed) await store.reload();
+        if (config.remoteInvestmentSelectionUrl) {
+          const selectionResult = await remoteSelectionRefresher(config, {
+            expectedRevision: store.getStatus().revision
+          });
+          if (!selectionResult?.success) {
+            throw new Error(
+              selectionResult?.error || "GitHub 최신 투자선정 파일을 받지 못했습니다."
+            );
+          }
+        }
         remoteSnapshotStatus.status = "ok";
         remoteSnapshotStatus.source = "remote";
         remoteSnapshotStatus.lastSuccessAt = new Date().toISOString();
@@ -248,6 +272,36 @@ export async function createLongviewApp(
       return;
     }
 
+    if (readMethod && url.pathname === "/api/investment-selection") {
+      await refreshStore();
+      try {
+        const artifact = validatePublicInvestmentSelection(
+          JSON.parse(await readFile(investmentSelectionFile, "utf8"))
+        );
+        const currentRevision = store.getStatus().revision;
+        if (artifact.sourceRevision !== currentRevision) {
+          sendJson(request, response, 409, {
+            code: "INVESTMENT_SELECTION_REVISION_MISMATCH",
+            error: "최신 기업 데이터와 자동투자 선정 기준일이 달라 표시를 보류합니다."
+          });
+          return;
+        }
+        sendJson(request, response, 200, artifact, {
+          cacheControl: DATA_CACHE,
+          etag: representationEtag(
+            artifact.sourceRevision,
+            "investment-selection:" + artifact.policyHash + ":" + artifact.generatedAt
+          )
+        });
+      } catch {
+        sendJson(request, response, 503, {
+          code: "INVESTMENT_SELECTION_UNAVAILABLE",
+          error: "검증된 자동투자 선정 산출물을 불러올 수 없습니다."
+        });
+      }
+      return;
+    }
+
     if (readMethod && url.pathname === "/api/companies") {
       try {
         const query = parseCompanyQuery(url.searchParams);
@@ -255,7 +309,6 @@ export async function createLongviewApp(
         const result = store.list(query);
         const variant = JSON.stringify([
           query.normalizedQuery,
-          query.country,
           query.sector,
           query.sort,
           query.candidateOnly,

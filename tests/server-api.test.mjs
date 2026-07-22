@@ -4,6 +4,7 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { createLongviewApp } from "../server.mjs";
+import { generateInvestmentSelectionFile } from "../scripts/generate-investment-selection.mjs";
 
 const UPDATED_AT = "2026-07-17T00:00:00.000Z";
 
@@ -106,7 +107,7 @@ test("overview, paginated list, detail, ETag와 reload가 함께 동작한다", 
   const dataFile = path.join(directory, "companies.json");
   const publicDir = path.join(directory, "public");
   await mkdir(publicDir);
-  let companies = [company(1), company(2), company(3, { country: "US", id: "US-TEST" })];
+  let companies = [company(1), company(2), company(3, { country: "JP", id: "JP-TEST" })];
   await writeFile(dataFile, JSON.stringify(snapshot(companies)), "utf8");
 
   const config = {
@@ -147,7 +148,8 @@ test("overview, paginated list, detail, ETag와 reload가 함께 동작한다", 
   assert.equal(overviewResponse.headers.get("x-frame-options"), "DENY");
   const etag = overviewResponse.headers.get("etag");
   const overview = await overviewResponse.json();
-  assert.equal(overview.summary.companies, 3);
+  assert.equal(overview.summary.companies, 2);
+  assert.deepEqual(overview.meta.coverage, { total: 2, kr: 2 });
   assert.equal("errors" in overview.meta.sync, false);
 
   const notModified = await fetch(baseUrl + "/api/overview", {
@@ -178,7 +180,7 @@ test("overview, paginated list, detail, ETag와 reload가 함께 동작한다", 
   );
 
   const listResponse = await fetch(
-    baseUrl + "/api/companies?country=KR&sort=name&page=2&pageSize=1"
+    baseUrl + "/api/companies?sort=name&page=2&pageSize=1"
   );
   assert.equal(listResponse.status, 200);
   const list = await listResponse.json();
@@ -187,12 +189,15 @@ test("overview, paginated list, detail, ETag와 reload가 함께 동작한다", 
   assert.equal(list.items[0].position, 2);
   assert.equal("disclosures" in list.items[0], false);
 
-  const detailResponse = await fetch(baseUrl + "/api/companies/" + encodeURIComponent("US-TEST"));
+  const detailResponse = await fetch(
+    baseUrl + "/api/companies/" + encodeURIComponent("KR-000001")
+  );
   assert.equal(detailResponse.status, 200);
   const detail = await detailResponse.json();
-  assert.equal(detail.id, "US-TEST");
+  assert.equal(detail.id, "KR-000001");
   assert.equal(detail.disclosures.length, 1);
-  assert.equal((await fetch(baseUrl + "/api/companies/US-MISSING")).status, 404);
+  assert.equal((await fetch(baseUrl + "/api/companies/JP-TEST")).status, 404);
+  assert.equal((await fetch(baseUrl + "/api/companies?country=JP")).status, 400);
   assert.equal((await fetch(baseUrl + "/api/companies?pageSize=101")).status, 400);
 
   companies = [...companies, company(6)];
@@ -202,7 +207,7 @@ test("overview, paginated list, detail, ETag와 reload가 함께 동작한다", 
     "utf8"
   );
   const refreshed = await (await fetch(baseUrl + "/api/overview")).json();
-  assert.equal(refreshed.summary.companies, 4);
+  assert.equal(refreshed.summary.companies, 3);
   assert.notEqual(refreshed.revision, overview.revision);
 
   const failedSync = await fetch(baseUrl + "/api/sync", {
@@ -211,11 +216,11 @@ test("overview, paginated list, detail, ETag와 reload가 함께 동작한다", 
   });
   assert.equal(failedSync.status, 502);
   const afterFailedSync = await (await fetch(baseUrl + "/api/overview")).json();
-  assert.equal(afterFailedSync.summary.companies, 6);
+  assert.equal(afterFailedSync.summary.companies, 5);
 
   const health = await (await fetch(baseUrl + "/api/health")).json();
   assert.equal(health.status, "ok");
-  assert.equal(health.companies, 6);
+  assert.equal(health.companies, 5);
   assert.equal(health.dataLoadStatus, "ok");
 });
 
@@ -308,4 +313,96 @@ test("원격 모드는 추적 파일을 건드리지 않고 runtime snapshot으�
   assert.equal(health.schedulerMode, "remote_snapshot");
   assert.equal(health.remoteSnapshot.status, "ok");
   assert.equal(health.remoteSnapshot.source, "remote");
+});
+
+test("민감정보 없는 최신 자동투자 선정 산출물만 API로 공개한다", async (t) => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "longview-selection-api-"));
+  const dataFile = path.join(directory, "companies.json");
+  const investmentSelectionFile = path.join(directory, "trading-selection.json");
+  const publicDir = path.join(directory, "public");
+  await mkdir(publicDir);
+  const companies = [8_000, 23_000, 9_000].map((price, index) =>
+    company(index + 1, {
+      sector: `선정업종-${index + 1}`,
+      marketData: {
+        ...currentMarketData(),
+        price,
+        marketCap: 200_000_000_000,
+        turnover: 1_000_000_000
+      }
+    })
+  );
+  await writeFile(dataFile, JSON.stringify(snapshot(companies)), "utf8");
+  await generateInvestmentSelectionFile({
+    dataFile,
+    outputFile: investmentSelectionFile,
+    now: new Date("2026-07-19T00:00:00.000Z")
+  });
+
+  const app = await createLongviewApp(
+    {
+      dataFile,
+      investmentSelectionFile,
+      publicDir,
+      host: "127.0.0.1",
+      port: 0,
+      schedulerEnabled: false,
+      scheduleHourKst: 21,
+      syncToken: ""
+    },
+    {
+      storeOptions: {
+        refreshIntervalMs: 0,
+        now: () => Date.parse("2026-07-19T00:00:00.000Z")
+      }
+    }
+  );
+  const address = await app.listen();
+  const baseUrl = "http://127.0.0.1:" + address.port;
+  t.after(async () => {
+    await app.close();
+    await rm(directory, { recursive: true, force: true });
+  });
+
+  const response = await fetch(baseUrl + "/api/investment-selection");
+  assert.equal(response.status, 200);
+  const etag = response.headers.get("etag");
+  const selection = await response.json();
+  assert.equal(selection.status, "ready");
+  assert.equal(selection.selected.length, 3);
+  const serialized = JSON.stringify(selection);
+  for (const forbidden of ["accountNumber", "quantity", "orderId", "appKey", "appSecret"]) {
+    assert.equal(serialized.includes(`\"${forbidden}\"`), false);
+  }
+  assert.equal(
+    (
+      await fetch(baseUrl + "/api/investment-selection", {
+        headers: { "If-None-Match": etag }
+      })
+    ).status,
+    304
+  );
+
+  const regenerated = structuredClone(selection);
+  regenerated.generatedAt = "2026-07-19T01:00:00.000Z";
+  await writeFile(investmentSelectionFile, JSON.stringify(regenerated), "utf8");
+  const regeneratedResponse = await fetch(baseUrl + "/api/investment-selection", {
+    headers: { "If-None-Match": etag }
+  });
+  assert.equal(regeneratedResponse.status, 200);
+  assert.notEqual(regeneratedResponse.headers.get("etag"), etag);
+  await regeneratedResponse.arrayBuffer();
+
+  const revisionMismatch = structuredClone(selection);
+  revisionMismatch.sourceRevision = "different-revision";
+  await writeFile(investmentSelectionFile, JSON.stringify(revisionMismatch), "utf8");
+  const stale = await fetch(baseUrl + "/api/investment-selection");
+  assert.equal(stale.status, 409);
+  assert.equal((await stale.json()).code, "INVESTMENT_SELECTION_REVISION_MISMATCH");
+
+  selection.selected[0].quantity = 1;
+  await writeFile(investmentSelectionFile, JSON.stringify(selection), "utf8");
+  const rejected = await fetch(baseUrl + "/api/investment-selection");
+  assert.equal(rejected.status, 503);
+  assert.equal((await rejected.json()).code, "INVESTMENT_SELECTION_UNAVAILABLE");
 });
