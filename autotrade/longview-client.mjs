@@ -281,15 +281,16 @@ export function buildPublishedSelectionSignalRevision(
     !isRecord(selection) ||
     !nonEmptyString(selection.generatedAt) ||
     !nonEmptyString(selection.policyHash) ||
-    !Array.isArray(selection.selected)
+    !Array.isArray(selection.ranked)
   ) {
     throw clientError("CONFIG_INVALID");
   }
-  const selected = selection.selected.map((item) => [
+  const ranked = selection.ranked.map((item) => [
     item.id,
     item.investmentRank,
-    item.targetWeight,
-    item.referenceNotionalKrw
+    item.score,
+    item.currentPriceKrw,
+    item.quoteAsOf
   ]);
   const digest = createHash("sha256")
     .update(
@@ -302,7 +303,7 @@ export function buildPublishedSelectionSignalRevision(
         "\0" +
         selection.policyHash +
         "\0" +
-        JSON.stringify(selected)
+        JSON.stringify(ranked)
     )
     .digest("hex");
   return "longview-selection-v1-" + digest;
@@ -567,9 +568,9 @@ export class LongviewClient {
         revision: rawRevision,
         modelVersion
       });
-      candidateSummaries = selection.selected;
+      candidateSummaries = selection.ranked;
       candidates = await mapLimited(
-        selection.selected,
+        selection.ranked,
         this.detailConcurrency,
         async (summary) => {
           const detail = await this.getCompany(summary.id, { modelVersion });

@@ -20,8 +20,8 @@ export const CLOUD_LIVE_ACKNOWLEDGEMENT =
   "I_ACCEPT_GITHUB_ACTIONS_LIVE_TRADING";
 export const DEFAULT_CLOUD_LEASE_MS = 20 * 60 * 1_000;
 
-const CLOUD_COMMANDS = new Set(["plan", "trade", "reconcile"]);
-const MUTATING_COMMANDS = new Set(["trade", "reconcile"]);
+const CLOUD_COMMANDS = new Set(["plan", "trade", "reconcile", "topup-plan", "topup"]);
+const MUTATING_COMMANDS = new Set(["trade", "reconcile", "topup"]);
 const SCHEDULED_COMMANDS = new Map([
   ["23 0 * * 1-5", "trade"],
   ["13 6 * * 1-5", "reconcile"]
@@ -56,7 +56,9 @@ function parsePositiveInteger(value, fallback, label) {
 function normalizeCommand(value) {
   const command = String(value || "plan").trim().toLowerCase();
   if (!CLOUD_COMMANDS.has(command)) {
-    throw new Error("클라우드 자동투자 명령은 plan, trade, reconcile 중 하나여야 합니다.");
+    throw new Error(
+      "클라우드 자동투자 명령은 plan, trade, reconcile, topup-plan, topup 중 하나여야 합니다."
+    );
   }
   return command;
 }
@@ -86,6 +88,10 @@ export function assertCloudLiveAuthorization(command, config, env = process.env)
   }
   if (env.GITHUB_EVENT_NAME === "workflow_dispatch") {
     exact(env.CLOUD_MANUAL_LIVE_CONFIRM, "true", "수동 실전 실행");
+  }
+  if (command === "topup") {
+    exact(env.GITHUB_EVENT_NAME, "workflow_dispatch", "추가입금 수동 이벤트");
+    exact(env.CLOUD_MANUAL_TOPUP_ID, String(env.GITHUB_RUN_ID || ""), "추가입금 실행 식별자");
   }
 
   exact(env.CLOUD_LIVE_TRADING_ACK, CLOUD_LIVE_ACKNOWLEDGEMENT, "클라우드 실전 위험");
@@ -238,10 +244,10 @@ function reconciliationNeedsAttention(summary) {
 
 function assertSafeExecutionSummary(command, summary) {
   const blockedExecution =
-    new Set(["plan", "trade"]).has(command) &&
+    new Set(["plan", "trade", "topup-plan", "topup"]).has(command) &&
     (summary?.ok !== true || Number(summary?.blockedCount) > 0);
   const unresolvedReconciliation =
-    new Set(["trade", "reconcile"]).has(command) &&
+    new Set(["trade", "reconcile", "topup"]).has(command) &&
     reconciliationNeedsAttention(summary?.reconciliation);
   if (blockedExecution || unresolvedReconciliation) {
     throw new CloudAutotradeOutcomeError();
@@ -338,11 +344,23 @@ export async function runCloudAutotrade({
     });
 
     let summary;
-    if (command === "plan") {
+    if (command === "plan" || command === "topup-plan") {
       // plan never submits broker orders. Passing the confirmation flag here
       // only lets the same live-order risk rules validate the proposed plan.
-      summary = executionSummary(command, await engine.plan({ liveConfirmation: true }));
-    } else if (command === "trade") {
+      summary = executionSummary(
+        command,
+        await engine.plan(
+          command === "topup-plan"
+            ? {
+                liveConfirmation: true,
+                force: true,
+                cashDeploymentOnly: true,
+                cycleScope: `manual-topup-plan:${env.GITHUB_RUN_ID}`
+              }
+            : { liveConfirmation: true }
+        )
+      );
+    } else if (command === "trade" || command === "topup") {
       const previous = await reconcile(engine, {
         trigger: "github-actions-pretrade",
         cancelOpenOrders: false
@@ -359,10 +377,20 @@ export async function runCloudAutotrade({
           reconciliation: previousSummary
         };
       } else {
-        const result = await engine.execute({
-          trigger: "github-actions-scheduled",
-          liveConfirmation: true
-        });
+        const result = await engine.execute(
+          command === "topup"
+            ? {
+                trigger: "github-actions-manual-topup",
+                liveConfirmation: true,
+                force: true,
+                cashDeploymentOnly: true,
+                cycleScope: `manual-topup:${env.GITHUB_RUN_ID}`
+              }
+            : {
+                trigger: "github-actions-scheduled",
+                liveConfirmation: true
+              }
+        );
         summary = executionSummary(command, result, previousSummary);
       }
     } else {

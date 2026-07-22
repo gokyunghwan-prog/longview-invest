@@ -363,6 +363,7 @@ function applyTurnoverAndCashLimits(candidates, {
       const bufferedExposure =
         minimumQuantity *
         bufferedCashPrice(candidate.limitPrice, "buy", policy.limitPriceBuffer);
+      if (positionValue >= candidate.targetValueKrw - 1) continue;
       if (rawNotional > remainingTurnover + 1) continue;
       if (positionValue + bufferedExposure > maximumPositionKrw + 1) continue;
       if (sectorValue + bufferedExposure > maximumSectorKrw + 1) continue;
@@ -409,7 +410,8 @@ export function planMonthlyRebalance({
   state = {},
   config = {},
   now,
-  force = false
+  force = false,
+  cashDeploymentOnly = false
 } = {}) {
   const policy = normalizedConfig(config);
   const previousStrategy = strategyState(state);
@@ -492,53 +494,58 @@ export function planMonthlyRebalance({
   const initialDeploymentCompleted =
     previousStrategy.initialDeploymentCompleted === true ||
     currentInvestedWeight + deploymentCompletionTolerance >= portfolioTargetWeight;
-  const turnoverCapWeight = initialDeploymentCompleted
+  const regularTurnoverCapWeight = initialDeploymentCompleted
     ? policy.maximumTurnoverWeight
     : policy.initialDeploymentTurnoverWeight;
+  const turnoverCapWeight = cashDeploymentOnly
+    ? Math.min(regularTurnoverCapWeight, cashKrw / equity)
+    : regularTurnoverCapWeight;
 
-  for (const selectedCompany of selected) {
-    delete nextStreaks[selectedCompany.securityKey || portfolioSecurityKey(selectedCompany)];
-    delete nextStreaks[selectedCompany.id];
-  }
+  if (!cashDeploymentOnly) {
+    for (const selectedCompany of selected) {
+      delete nextStreaks[selectedCompany.securityKey || portfolioSecurityKey(selectedCompany)];
+      delete nextStreaks[selectedCompany.id];
+    }
 
-  for (const position of positions) {
-    const id = String(position.id);
-    const securityKey = portfolioSecurityKey(position);
-    if (selectedByKey.has(securityKey)) continue;
-    const evaluation = evaluations.get(securityKey);
-    if (evaluationHasDataFailure(evaluation)) {
-      skipped.push({ id, reason: "data_failure_is_not_sell_signal" });
-      replacementSlotsWaiting += 1;
-      continue;
+    for (const position of positions) {
+      const id = String(position.id);
+      const securityKey = portfolioSecurityKey(position);
+      if (selectedByKey.has(securityKey)) continue;
+      const evaluation = evaluations.get(securityKey);
+      if (evaluationHasDataFailure(evaluation)) {
+        skipped.push({ id, reason: "data_failure_is_not_sell_signal" });
+        replacementSlotsWaiting += 1;
+        continue;
+      }
+      const streak =
+        (finite(previousStreaks[securityKey]) ?? finite(previousStreaks[id]) ?? 0) + 1;
+      delete nextStreaks[id];
+      nextStreaks[securityKey] = streak;
+      if (streak < policy.removalConfirmations) {
+        skipped.push({ id, reason: "removal_confirmation_pending", streak });
+        replacementSlotsWaiting += 1;
+        continue;
+      }
+      const quantity = Math.floor(positive(position.quantity) || 0);
+      const evaluationCompany = evaluation?.company || {};
+      const source = { ...evaluationCompany, ...position, id };
+      const localPrice = priceKrw(position, null, evaluation);
+      const limitPrice = nativePrice(position, null, evaluation);
+      if (!quantity || !localPrice || !limitPrice) {
+        skipped.push({ id, reason: "position_price_missing" });
+        continue;
+      }
+      candidates.push({
+        source,
+        side: "sell",
+        quantity,
+        priceKrw: localPrice,
+        limitPrice,
+        reason: "confirmed_removal",
+        priority: 0,
+        score: evaluation?.score ?? -Infinity
+      });
     }
-    const streak =
-      (finite(previousStreaks[securityKey]) ?? finite(previousStreaks[id]) ?? 0) + 1;
-    delete nextStreaks[id];
-    nextStreaks[securityKey] = streak;
-    if (streak < policy.removalConfirmations) {
-      skipped.push({ id, reason: "removal_confirmation_pending", streak });
-      replacementSlotsWaiting += 1;
-      continue;
-    }
-    const quantity = Math.floor(positive(position.quantity) || 0);
-    const evaluationCompany = evaluation?.company || {};
-    const source = { ...evaluationCompany, ...position, id };
-    const localPrice = priceKrw(position, null, evaluation);
-    const limitPrice = nativePrice(position, null, evaluation);
-    if (!quantity || !localPrice || !limitPrice) {
-      skipped.push({ id, reason: "position_price_missing" });
-      continue;
-    }
-    candidates.push({
-      source,
-      side: "sell",
-      quantity,
-      priceKrw: localPrice,
-      limitPrice,
-      reason: "confirmed_removal",
-      priority: 0,
-      score: evaluation?.score ?? -Infinity
-    });
   }
 
   for (const target of selected) {
@@ -573,6 +580,10 @@ export function planMonthlyRebalance({
     });
     if (differenceWeight < driftThreshold) continue;
     const side = difference > 0 ? "buy" : "sell";
+    if (cashDeploymentOnly && side === "sell") {
+      skipped.push({ id: target.id, reason: "cash_deployment_buy_only" });
+      continue;
+    }
     let quantity = Math.floor(Math.abs(difference) / localPrice);
     if (side === "sell") quantity = Math.min(quantity, Math.floor(positive(position?.quantity) || 0));
     if (quantity <= 0) continue;
@@ -607,11 +618,19 @@ export function planMonthlyRebalance({
     positionValues,
     sectorValues
   });
-  const nextState = withStrategyState(state, {
-    lastPlanAt: isoNow,
-    removalStreaks: nextStreaks,
-    initialDeploymentCompleted
-  });
+  const nextState = withStrategyState(
+    state,
+    cashDeploymentOnly
+      ? {
+          removalStreaks: previousStreaks,
+          initialDeploymentCompleted: previousStrategy.initialDeploymentCompleted === true
+        }
+      : {
+          lastPlanAt: isoNow,
+          removalStreaks: nextStreaks,
+          initialDeploymentCompleted
+        }
+  );
 
   return {
     status: "planned",
@@ -629,7 +648,8 @@ export function planMonthlyRebalance({
       estimatedCashAfterKrw: limited.estimatedCashAfterKrw,
       reserveKrw: equity * Math.max(policy.reserveWeight, portfolio.cashTargetWeight || 0),
       rebalanceFrequency: policy.rebalanceFrequency,
-      reuseProjectedSellProceeds: policy.reuseProjectedSellProceeds
+      reuseProjectedSellProceeds: policy.reuseProjectedSellProceeds,
+      cashDeploymentOnly
     }
   };
 }

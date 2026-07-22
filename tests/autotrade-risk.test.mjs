@@ -23,8 +23,30 @@ test("실행 키는 데이터·모델·전략·기간을 모두 반영한다", (
   };
   const first = buildCycleKey(base);
   assert.equal(first, buildCycleKey(base));
+  assert.equal(first, buildCycleKey({ ...base, scope: "" }));
   assert.notEqual(first, buildCycleKey({ ...base, modelVersion: "2.1.0" }));
   assert.notEqual(first, buildCycleKey({ ...base, signalRevision: "raw-b" }));
+  assert.notEqual(first, buildCycleKey({ ...base, scope: "manual-topup:123" }));
+  assert.equal(
+    buildCycleKey({ ...base, scope: "manual-topup:123" }),
+    buildCycleKey({ ...base, scope: "manual-topup:123" })
+  );
+  assert.equal(
+    buildCycleKey({ ...base, scope: "manual-topup:123" }),
+    buildCycleKey({
+      ...base,
+      signalRevision: "raw-new",
+      modelVersion: "9.9.9",
+      strategyVersion: "new-strategy",
+      period: "2027-01",
+      scope: "manual-topup:123"
+    }),
+    "명시적 일회성 실행은 데이터나 날짜가 바뀐 뒤 재실행해도 같은 키여야 한다"
+  );
+  assert.notEqual(
+    buildCycleKey({ ...base, scope: "manual-topup:123" }),
+    buildCycleKey({ ...base, accountId: "another-account", scope: "manual-topup:123" })
+  );
 });
 
 test("오래되거나 모델이 바뀐 신호는 주문 전에 차단한다", () => {

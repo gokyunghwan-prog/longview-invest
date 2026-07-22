@@ -370,10 +370,15 @@ function companyCard(company, visibleRank) {
     company.reasons?.[0] || "구조화된 공시 데이터에서 평가 근거를 생성하지 못했습니다.";
   const candidate = company.score.candidate;
   const investmentSelection = company.investmentSelection || null;
+  const referenceCapitalKrw = Number(
+    state.investmentSelection?.policy?.referenceCapitalKrw || 0
+  );
   const investmentBadge = investmentSelection
     ? '<span class="investment-selection-badge">자동투자 목표 ' +
       (Number(investmentSelection.targetWeight || 0) * 100).toFixed(1) +
-      '% · 10만원 주식단위 참고 ' +
+      "% · " +
+      referenceCapitalKrw.toLocaleString("ko-KR") +
+      "원 주식단위 참고 " +
       (Number(investmentSelection.referenceAllocationWeight || 0) * 100).toFixed(1) +
       "%</span>"
     : "";
@@ -571,6 +576,7 @@ function renderInvestmentSelectionNote(artifact = null) {
     return;
   }
   const summary = artifact.summary || {};
+  const referenceCapitalKrw = Number(artifact.policy?.referenceCapitalKrw || 0);
   const generatedAt = artifact.generatedAt
     ? new Date(artifact.generatedAt).toLocaleString("ko-KR", { timeZone: "Asia/Seoul" })
     : "—";
@@ -578,7 +584,9 @@ function renderInvestmentSelectionNote(artifact = null) {
   note.innerHTML =
     '<div><strong>오늘의 자동투자 선정 ' +
     Number(summary.selected || 0).toLocaleString("ko-KR") +
-    "개</strong><span>10만원 참조 · 목표 현금 0% · 종목/업종 최대 35%</span></div>" +
+    "개</strong><span>" +
+    referenceCapitalKrw.toLocaleString("ko-KR") +
+    "원 공개 예시 · 실제 계좌자금에 맞춰 같은 순위에서 재선정 · 목표 현금 0% · 종목/업종 최대 35%</span></div>" +
     '<p>정수 주식 단위 참고 투자액 ' +
     Number(summary.referenceInvestedKrw || 0).toLocaleString("ko-KR") +
     "원 · 불가피한 참고 잔액 " +

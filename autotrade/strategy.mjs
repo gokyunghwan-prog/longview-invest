@@ -441,11 +441,7 @@ export function selectPublishedPortfolio({
   const policy = strategyConfig(config);
   const equity = positive(totalEquityKrw);
   if (!equity) throw new RangeError("totalEquityKrw는 0보다 커야 합니다.");
-  const evaluations = companies.map((company) =>
-    evaluateCandidate({ company, quotes, config, now })
-  );
-  const evaluationsById = new Map(evaluations.map((item) => [item.id, item]));
-  const published = Array.isArray(selection?.selected) ? selection.selected : [];
+  const published = Array.isArray(selection?.ranked) ? selection.ranked : [];
   const blockedReasons = [];
   if (!selection || selection.status !== "ready") {
     blockedReasons.push("published_selection_not_ready");
@@ -453,105 +449,81 @@ export function selectPublishedPortfolio({
   if (selection?.strategyVersion !== config?.strategy?.version) {
     blockedReasons.push("published_selection_strategy_mismatch");
   }
-  if (
-    published.length < policy.minimumPositions ||
-    published.length > policy.maximumPositions
-  ) {
-    blockedReasons.push("published_selection_position_count_invalid");
+  if (published.length < policy.minimumPositions) {
+    blockedReasons.push("published_ranking_too_short");
   }
 
-  const selected = [];
-  const sectorWeights = {};
+  const companiesById = new Map(companies.map((company) => [company.id, company]));
+  const publishedCompanies = [];
+  const investmentRanks = new Map();
   const seen = new Set();
   for (const entry of published) {
     if (!entry?.id || seen.has(entry.id)) {
-      blockedReasons.push("published_selection_duplicate_or_missing_id");
+      blockedReasons.push("published_ranking_duplicate_or_missing_id");
       continue;
     }
     seen.add(entry.id);
-    const candidate = evaluationsById.get(entry.id);
-    if (!candidate) {
-      blockedReasons.push(`published_selection_company_missing:${entry.id}`);
+    const company = companiesById.get(entry.id);
+    if (!company) {
+      blockedReasons.push(`published_ranking_company_missing:${entry.id}`);
       continue;
     }
-    if (!candidate.eligible) {
-      blockedReasons.push(`published_selection_company_ineligible:${entry.id}`);
-      continue;
-    }
-    const targetWeight = finite(entry.targetWeight);
     if (
-      targetWeight === null ||
-      targetWeight <= 0 ||
-      targetWeight > policy.maximumPositionWeight + 1e-12
+      String(entry.ticker || "") !== String(company.ticker || "") ||
+      String(entry.country || "").toUpperCase() !==
+        String(company.country || "").toUpperCase() ||
+      String(entry.exchange || "") !== String(company.exchange || "")
     ) {
-      blockedReasons.push(`published_selection_weight_invalid:${entry.id}`);
+      blockedReasons.push(`published_ranking_company_mismatch:${entry.id}`);
       continue;
     }
-    const targetNotionalKrw = equity * targetWeight;
-    if (
-      targetNotionalKrw < policy.minimumPositionKrw ||
-      candidate.quote.priceKrw > targetNotionalKrw
-    ) {
-      blockedReasons.push(`published_selection_not_affordable:${entry.id}`);
-      continue;
-    }
-    sectorWeights[candidate.sector] = roundWeight(
-      (sectorWeights[candidate.sector] || 0) + targetWeight
-    );
-    selected.push({
-      ...selectionView(candidate, targetWeight),
-      investmentRank: entry.investmentRank
-    });
+    publishedCompanies.push(company);
+    investmentRanks.set(entry.id, entry.investmentRank);
   }
 
-  const publishedWeight = roundWeight(
-    published.reduce((sum, entry) => sum + (finite(entry?.targetWeight) || 0), 0)
+  const preferredPositions = clamp(
+    finite(selection?.policy?.preferredPositions) ?? policy.minimumPositions,
+    policy.minimumPositions,
+    policy.maximumPositions
   );
-  const investableWeight = roundWeight(1 - policy.reserveWeight);
-  if (Math.abs(publishedWeight - investableWeight) > 1e-9) {
-    blockedReasons.push("published_selection_weight_sum_invalid");
-  }
-  if (
-    Object.values(sectorWeights).some(
-      (weight) => weight > policy.maximumSectorWeight + 1e-12
-    )
-  ) {
-    blockedReasons.push("published_selection_sector_limit_exceeded");
-  }
-  if (selected.length !== published.length) {
-    blockedReasons.push("published_selection_not_fully_executable");
-  }
-  const ready = blockedReasons.length === 0;
-  const investedTargetWeight =
-    Math.abs(publishedWeight - investableWeight) <= 1e-9
-      ? investableWeight
-      : publishedWeight;
+  const capitalAwareConfig = {
+    ...config,
+    strategy: {
+      ...(config.strategy || {}),
+      minimumPositions: policy.minimumPositions,
+      maximumPositions: preferredPositions
+    }
+  };
+  const dynamic = selectBalancedPortfolio({
+    companies: publishedCompanies,
+    quotes,
+    totalEquityKrw: equity,
+    config: capitalAwareConfig,
+    now
+  });
+  blockedReasons.push(...dynamic.blockedReasons);
+  const allEvaluations = companies.map((company) =>
+    evaluateCandidate({ company, quotes, config: capitalAwareConfig, now })
+  );
+  const selected = dynamic.selected.map((item) => ({
+    ...item,
+    investmentRank: investmentRanks.get(item.id)
+  }));
+  const ready = blockedReasons.length === 0 && dynamic.status === "ready";
 
   return {
+    ...dynamic,
     strategy: selection?.strategyVersion || INVESTMENT_SELECTION_STRATEGY_VERSION,
     status: ready ? "ready" : "blocked",
     deployable: ready,
     blockedReasons: [...new Set(blockedReasons)],
-    totalEquityKrw: equity,
-    desiredPositions: published.length,
-    minimumPositions: policy.minimumPositions,
-    maximumPositions: policy.maximumPositions,
-    targetPositionWeight: published[0]?.targetWeight || 0,
-    investedTargetWeight,
-    cashTargetWeight: roundWeight(Math.max(policy.reserveWeight, 1 - investedTargetWeight)),
     selected,
     targetWeights: Object.fromEntries(selected.map((item) => [item.id, item.targetWeight])),
-    sectorWeights,
-    evaluations,
+    evaluations: allEvaluations,
     diagnostics: {
-      evaluated: evaluations.length,
-      eligible: evaluations.filter((item) => item.eligible).length,
-      affordable: selected.length,
-      selected: selected.length,
-      targetNotionalKrw:
-        published.length > 0 ? equity * (finite(published[0]?.targetWeight) || 0) : 0,
-      capitalCapacity: Math.floor(equity / policy.minimumPositionKrw),
-      source: "published_investment_selection"
+      ...dynamic.diagnostics,
+      publishedRanked: published.length,
+      source: "published_capital_aware_ranking"
     }
   };
 }

@@ -15,10 +15,12 @@ on:
         default: plan
         options:
           - plan
+          - topup-plan
           - trade
           - reconcile
+          - topup
       confirm_live:
-        description: "Required for manual trade/reconcile; ignored by plan"
+        description: "Required for manual trade/reconcile/topup; ignored by safe plans"
         required: true
         type: boolean
         default: false
@@ -35,7 +37,7 @@ jobs:
     # The workflow is committed disabled: schedules remain skipped until the
     # owner deliberately creates AUTOTRADE_LIVE_ENABLED=true. Manual plan is
     # still available for a no-order end-to-end validation.
-    if: github.event_name == 'workflow_dispatch' || vars.AUTOTRADE_LIVE_ENABLED == 'true'
+    if: (github.event_name == 'workflow_dispatch' || vars.AUTOTRADE_LIVE_ENABLED == 'true') && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     env:
@@ -70,6 +72,7 @@ jobs:
       - name: Check out the default branch without persisted credentials
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
+          ref: main
           persist-credentials: false
 
       - name: Set up Node.js
@@ -78,7 +81,7 @@ jobs:
           node-version: "22"
 
       - name: Reject an unconfirmed manual live operation
-        if: github.event_name == 'workflow_dispatch' && inputs.operation != 'plan' && (inputs.confirm_live != true || vars.AUTOTRADE_LIVE_ENABLED != 'true')
+        if: github.event_name == 'workflow_dispatch' && inputs.operation != 'plan' && inputs.operation != 'topup-plan' && (inputs.confirm_live != true || vars.AUTOTRADE_LIVE_ENABLED != 'true')
         run: |
           echo "Manual trade/reconcile requires confirm_live and AUTOTRADE_LIVE_ENABLED=true."
           exit 1
@@ -86,7 +89,7 @@ jobs:
       - name: Validate the runner and its safety contracts
         run: |
           node --check scripts/cloud-autotrade.mjs
-          node --test tests/autotrade-cloud-state.test.mjs tests/autotrade-cloud-runner.test.mjs tests/autotrade-kis.test.mjs tests/autotrade-reconciliation.test.mjs
+          node --test tests/autotrade-cloud-state.test.mjs tests/autotrade-cloud-runner.test.mjs tests/autotrade-engine.test.mjs tests/autotrade-kis.test.mjs tests/autotrade-planner.test.mjs tests/autotrade-reconciliation.test.mjs tests/autotrade-risk.test.mjs tests/autotrade-strategy.test.mjs
 
       - name: Start the read-only Longview ranking API
         run: |
@@ -104,6 +107,23 @@ jobs:
       - name: Manual safe plan (no orders)
         if: github.event_name == 'workflow_dispatch' && inputs.operation == 'plan'
         run: node scripts/cloud-autotrade.mjs plan
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          AUTOTRADE_STATE_KEY: ${{ secrets.AUTOTRADE_STATE_KEY }}
+          KIS_APP_KEY: ${{ secrets.KIS_APP_KEY }}
+          KIS_APP_SECRET: ${{ secrets.KIS_APP_SECRET }}
+          KIS_ACCOUNT_NUMBER: ${{ secrets.KIS_ACCOUNT_NUMBER }}
+          KIS_ACCOUNT_PRODUCT_CODE: ${{ secrets.KIS_ACCOUNT_PRODUCT_CODE }}
+          KIS_HTS_ID: ${{ secrets.KIS_HTS_ID }}
+          LIVE_TRADING_ACK: ${{ secrets.LIVE_TRADING_ACK }}
+          USE_ALL_DEDICATED_ACCOUNT_ASSETS_ACK: ${{ secrets.USE_ALL_DEDICATED_ACCOUNT_ASSETS_ACK }}
+          UNATTENDED_LIVE_TRADING_ACK: ${{ secrets.UNATTENDED_LIVE_TRADING_ACK }}
+          CLOUD_LIVE_TRADING_ACK: ${{ secrets.CLOUD_LIVE_TRADING_ACK }}
+          CLOUD_MANUAL_LIVE_CONFIRM: "false"
+
+      - name: Manual top-up plan (no orders)
+        if: github.event_name == 'workflow_dispatch' && inputs.operation == 'topup-plan'
+        run: node scripts/cloud-autotrade.mjs topup-plan
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           AUTOTRADE_STATE_KEY: ${{ secrets.AUTOTRADE_STATE_KEY }}
@@ -185,3 +205,21 @@ jobs:
           UNATTENDED_LIVE_TRADING_ACK: ${{ secrets.UNATTENDED_LIVE_TRADING_ACK }}
           CLOUD_LIVE_TRADING_ACK: ${{ secrets.CLOUD_LIVE_TRADING_ACK }}
           CLOUD_MANUAL_LIVE_CONFIRM: "true"
+
+      - name: Confirmed manual top-up deployment
+        if: github.event_name == 'workflow_dispatch' && inputs.operation == 'topup' && inputs.confirm_live == true && vars.AUTOTRADE_LIVE_ENABLED == 'true'
+        run: node scripts/cloud-autotrade.mjs topup
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          AUTOTRADE_STATE_KEY: ${{ secrets.AUTOTRADE_STATE_KEY }}
+          KIS_APP_KEY: ${{ secrets.KIS_APP_KEY }}
+          KIS_APP_SECRET: ${{ secrets.KIS_APP_SECRET }}
+          KIS_ACCOUNT_NUMBER: ${{ secrets.KIS_ACCOUNT_NUMBER }}
+          KIS_ACCOUNT_PRODUCT_CODE: ${{ secrets.KIS_ACCOUNT_PRODUCT_CODE }}
+          KIS_HTS_ID: ${{ secrets.KIS_HTS_ID }}
+          LIVE_TRADING_ACK: ${{ secrets.LIVE_TRADING_ACK }}
+          USE_ALL_DEDICATED_ACCOUNT_ASSETS_ACK: ${{ secrets.USE_ALL_DEDICATED_ACCOUNT_ASSETS_ACK }}
+          UNATTENDED_LIVE_TRADING_ACK: ${{ secrets.UNATTENDED_LIVE_TRADING_ACK }}
+          CLOUD_LIVE_TRADING_ACK: ${{ secrets.CLOUD_LIVE_TRADING_ACK }}
+          CLOUD_MANUAL_LIVE_CONFIRM: "true"
+          CLOUD_MANUAL_TOPUP_ID: ${{ github.run_id }}

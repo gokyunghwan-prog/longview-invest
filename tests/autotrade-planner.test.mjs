@@ -241,6 +241,64 @@ test("잔여 현금 스윕은 1주씩 결정적으로 추가하고 기존 주문
   assert.ok(result.diagnostics.estimatedCashAfterKrw < 300_000);
 });
 
+test("잔여 현금 스윕은 이미 목표금액을 넘은 종목을 추가 매수하지 않는다", () => {
+  const selected = [
+    target("A", {
+      targetWeight: 0.5,
+      currentPrice: 110_000,
+      currentPriceKrw: 110_000
+    }),
+    target("B", {
+      targetWeight: 0.5,
+      currentPrice: 300_000,
+      currentPriceKrw: 300_000
+    })
+  ];
+  const result = planRebalance({
+    portfolio: portfolio(selected, {
+      investedTargetWeight: 1,
+      cashTargetWeight: 0
+    }),
+    account: {
+      totalEquityKrw: 1_000_000,
+      cashKrw: 450_000,
+      positionsValueKrw: 550_000,
+      positions: [
+        {
+          ...selected[0],
+          quantity: 5,
+          price: 110_000,
+          priceKrw: 110_000,
+          marketValueKrw: 550_000
+        }
+      ]
+    },
+    state: { strategy: { lastPlanAt: null, removalStreaks: {} } },
+    config: {
+      strategy: {
+        reserveWeight: 0,
+        rebalanceDrift: 0,
+        removalConfirmations: 2,
+        minimumOrderKrw: 1,
+        maximumPositionWeight: 0.7,
+        maximumSectorWeight: 1
+      },
+      risk: {
+        maximumTurnoverWeight: 1,
+        initialDeploymentTurnoverWeight: 1,
+        maximumOrdersPerRun: 20
+      }
+    },
+    now: "2026-08-20T00:00:00.000Z"
+  });
+
+  assert.deepEqual(
+    result.orders.map((order) => [order.id, order.side, order.quantity]),
+    [["B", "buy", 1]]
+  );
+  assert.equal(result.diagnostics.estimatedCashAfterKrw, 150_000);
+});
+
 test("현금 스윕은 지정가 버퍼와 예상 수수료까지 낼 수 있는 수량만 잡는다", () => {
   const selected = [target("A", { targetWeight: 1 })];
   const result = planRebalance({
@@ -644,4 +702,75 @@ test("KIS-style planning does not spend unconfirmed sell proceeds", () => {
 
   assert.deepEqual(result.orders.map((order) => order.side), ["sell"]);
   assert.equal(result.diagnostics.reuseProjectedSellProceeds, false);
+});
+
+test("추가입금 계획은 기존 교체 관찰을 바꾸지 않고 가용현금 안에서 매수만 만든다", () => {
+  const selected = [
+    target("A", { targetWeight: 1 / 3, sector: "업종-A" }),
+    target("B", { targetWeight: 1 / 3, sector: "업종-B" }),
+    target("C", { targetWeight: 1 / 3, sector: "업종-C" })
+  ];
+  const oldPosition = target("OLD", { targetWeight: 0, sector: "업종-OLD" });
+  const lastPlanAt = "2026-08-20T00:00:00.000Z";
+  const result = planRebalance({
+    portfolio: portfolio(selected, {
+      investedTargetWeight: 1,
+      cashTargetWeight: 0,
+      evaluations: [
+        {
+          id: "OLD",
+          securityKey: "KR:OLD",
+          eligible: false,
+          reasonCodes: ["score_below_minimum"],
+          quote: { price: 10_000, priceKrw: 10_000, currency: "KRW" },
+          company: oldPosition
+        }
+      ]
+    }),
+    account: {
+      totalEquityKrw: 1_000_000,
+      cashKrw: 900_000,
+      positions: [
+        { ...oldPosition, quantity: 10, price: 10_000, marketValueKrw: 100_000 }
+      ]
+    },
+    state: {
+      strategy: {
+        lastPlanAt,
+        removalStreaks: { "KR:OLD": 1 },
+        initialDeploymentCompleted: true
+      }
+    },
+    config: {
+      strategy: {
+        reserveWeight: 0,
+        rebalanceDrift: 0,
+        removalConfirmations: 2,
+        minimumOrderKrw: 1,
+        maximumPositionWeight: 0.35,
+        maximumSectorWeight: 0.35
+      },
+      risk: {
+        maximumTurnoverWeight: 1,
+        initialDeploymentTurnoverWeight: 1,
+        maximumOrdersPerRun: 20,
+        reuseProjectedSellProceeds: false
+      }
+    },
+    now: "2026-08-20T01:00:00.000Z",
+    force: true,
+    cashDeploymentOnly: true
+  });
+
+  assert.equal(result.status, "planned");
+  assert.ok(result.orders.length > 0);
+  assert.ok(result.orders.every((order) => order.side === "buy"));
+  assert.ok(
+    result.orders.reduce((sum, order) => sum + order.quantity * order.limitPrice, 0) <=
+      900_000
+  );
+  assert.deepEqual(result.nextState.strategy.removalStreaks, { "KR:OLD": 1 });
+  assert.equal(result.nextState.strategy.lastPlanAt, lastPlanAt);
+  assert.equal(result.nextState.strategy.initialDeploymentCompleted, true);
+  assert.equal(result.diagnostics.cashDeploymentOnly, true);
 });
