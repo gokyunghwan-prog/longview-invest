@@ -66,6 +66,77 @@ test("오래되거나 모델이 바뀐 신호는 주문 전에 차단한다", ()
   assert.ok(result.reasons.some((reason) => reason.includes("오래")));
 });
 
+test("후보 수 급변은 승인된 레거시 3→12 전환만 예외로 허용한다", () => {
+  const tradingConfig = config();
+  const current = {
+    revision: "r1",
+    modelVersion: tradingConfig.strategy.approvedModelVersion,
+    sourceUpdatedAt: "2026-07-22T00:00:00.000Z",
+    health: { dataLoadStatus: "ok" },
+    companies: Array.from({ length: 12 }, (_, index) => ({ id: `KR-${index}` }))
+  };
+  const baseline = assessSignal(current, tradingConfig, {
+    now: new Date("2026-07-22T01:00:00.000Z")
+  });
+
+  const sameScope = assessSignal(current, tradingConfig, {
+    now: new Date("2026-07-22T01:00:00.000Z"),
+    previous: { candidateCount: 3, candidateCountScope: baseline.candidateCountScope }
+  });
+  assert.equal(sameScope.ok, false);
+  assert.ok(sameScope.reasons.some((reason) => reason.includes("후보 수")));
+
+  const migratedScope = assessSignal(current, tradingConfig, {
+    now: new Date("2026-07-22T01:00:00.000Z"),
+    previous: { candidateCount: 3, candidateCountScope: null }
+  });
+  assert.equal(migratedScope.ok, true);
+
+  const contaminated = assessSignal(
+    {
+      ...current,
+      companies: Array.from({ length: 1_000 }, (_, index) => ({ id: `BAD-${index}` }))
+    },
+    tradingConfig,
+    {
+      now: new Date("2026-07-22T01:00:00.000Z"),
+      previous: { candidateCount: 3, candidateCountScope: null }
+    }
+  );
+  assert.equal(contaminated.ok, false);
+  assert.ok(contaminated.reasons.some((reason) => reason.includes("후보 수")));
+
+  const unapprovedStrategy = assessSignal(
+    current,
+    {
+      ...tradingConfig,
+      strategy: { ...tradingConfig.strategy, version: "unapproved-migration" }
+    },
+    {
+      now: new Date("2026-07-22T01:00:00.000Z"),
+      previous: { candidateCount: 3, candidateCountScope: null }
+    }
+  );
+  assert.equal(unapprovedStrategy.ok, false);
+  assert.ok(unapprovedStrategy.reasons.some((reason) => reason.includes("후보 수")));
+
+  const enrichedManagedCompanies = assessSignal(
+    {
+      ...current,
+      candidateSummaries: Array.from({ length: 8 }, (_, index) => ({ id: `RANK-${index}` })),
+      companies: Array.from({ length: 11 }, (_, index) => ({ id: `WITH-MANAGED-${index}` }))
+    },
+    tradingConfig,
+    {
+      now: new Date("2026-07-22T01:00:00.000Z"),
+      previous: { candidateCount: 12, candidateCountScope: baseline.candidateCountScope }
+    }
+  );
+  assert.equal(enrichedManagedCompanies.candidateCount, 8);
+  assert.equal(enrichedManagedCompanies.ok, false);
+  assert.ok(enrichedManagedCompanies.reasons.some((reason) => reason.includes("후보 수")));
+});
+
 test("시장가·중복·과도한 회전율과 확인 없는 실전 주문을 차단한다", () => {
   const live = config({
     TRADING_MODE: "live",
