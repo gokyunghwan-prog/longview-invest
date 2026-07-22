@@ -1,12 +1,12 @@
 const DEFAULT_PRODUCTION_URL = "https://openapi.koreainvestment.com:9443";
 const DEFAULT_VIRTUAL_URL = "https://openapivts.koreainvestment.com:29443";
-const DEFAULT_MINIMUM_INTERVAL_MS = 1_100;
+const DEFAULT_MINIMUM_INTERVAL_MS = 2_100;
 const DEFAULT_REQUEST_TIMEOUT_MS = 15_000;
 const DEFAULT_MAX_RESPONSE_BYTES = 2 * 1024 * 1024;
 const DEFAULT_MAX_BALANCE_PAGES = 10;
 const DEFAULT_MAX_BALANCE_ROWS = 5_000;
-const DEFAULT_READ_RATE_LIMIT_RETRIES = 3;
-const DEFAULT_READ_RATE_LIMIT_BACKOFF_MS = 2_000;
+const DEFAULT_READ_RATE_LIMIT_RETRIES = 4;
+const DEFAULT_READ_RATE_LIMIT_BACKOFF_MS = 5_000;
 const MAX_DAILY_ORDER_QUERY_CALENDAR_DAYS = 7;
 const TOKEN_EXPIRY_SKEW_MS = 60_000;
 const RATE_LIMIT_ERROR_CODES = new Set(["EGW00201"]);
@@ -547,6 +547,7 @@ export class KisBroker {
     this.tokenPromise = null;
     this.networkChain = Promise.resolve();
     this.lastRequestStartedAt = Number.NEGATIVE_INFINITY;
+    this.quoteBusinessDateCache = new Map();
   }
 
   _now() {
@@ -809,7 +810,9 @@ export class KisBroker {
         });
       } catch (error) {
         const retryable =
-          error instanceof KisApiError && RATE_LIMIT_ERROR_CODES.has(cleanText(error.code));
+          error instanceof KisApiError &&
+          (RATE_LIMIT_ERROR_CODES.has(cleanText(error.code)) ||
+            /초당.*거래건수/.test(cleanText(error.message)));
         if (!retryable || attempt >= this.readRateLimitRetries) throw error;
         await this.sleep(this.readRateLimitBackoffMs * 2 ** attempt);
       }
@@ -908,27 +911,7 @@ export class KisBroker {
     // The official inquire-price response does not include a business date.
     // Confirm it independently with the official daily-price endpoint instead
     // of treating the runner clock as proof that the quote belongs to today.
-    const dailyPayload = await this._readRequest(DOMESTIC_DAILY_PRICE_PATH, {
-      trId: "FHKST01010400",
-      query: {
-        FID_COND_MRKT_DIV_CODE: marketCode,
-        FID_INPUT_ISCD: ticker,
-        FID_PERIOD_DIV_CODE: "D",
-        FID_ORG_ADJ_PRC: "1"
-      }
-    });
-    const marketDates = asRows(dailyPayload.output)
-      .map((row) => cleanText(row.stck_bsop_date))
-      .filter((value) => /^\d{8}$/.test(value));
-    for (const marketDate of marketDates) {
-      dailyOrderQueryDate(marketDate, "KIS 시세 영업일");
-    }
-    const marketDate = marketDates.sort().at(-1) || "";
-    if (!marketDate) {
-      throw new KisApiError("KIS 국내주식 일자별 시세에 영업일이 없습니다.", {
-        code: "KIS_QUOTE_MARKET_DATE_MISSING"
-      });
-    }
+    const marketDate = await this._getQuoteBusinessDate({ marketCode, ticker });
     const observedAt = new Date(this._now()).toISOString();
     return {
       id: cleanText(instrument.id) || `KR:${ticker}`,
@@ -950,6 +933,42 @@ export class KisBroker {
       marketDate,
       marketTime: cleanText(output.stck_cntg_hour)
     };
+  }
+
+  async _getQuoteBusinessDate({ marketCode, ticker }) {
+    const observedBusinessDate = kstBusinessDate(this._now());
+    const cacheKey = `${marketCode}:${observedBusinessDate}`;
+    const cached = this.quoteBusinessDateCache.get(cacheKey);
+    if (cached === observedBusinessDate) return cached;
+
+    const dailyPayload = await this._readRequest(DOMESTIC_DAILY_PRICE_PATH, {
+      trId: "FHKST01010400",
+      query: {
+        FID_COND_MRKT_DIV_CODE: marketCode,
+        FID_INPUT_ISCD: ticker,
+        FID_PERIOD_DIV_CODE: "D",
+        FID_ORG_ADJ_PRC: "1"
+      }
+    });
+    const marketDates = asRows(dailyPayload.output)
+      .map((row) => cleanText(row.stck_bsop_date))
+      .filter((value) => /^\d{8}$/.test(value));
+    for (const marketDate of marketDates) {
+      dailyOrderQueryDate(marketDate, "KIS 시세 영업일");
+    }
+    const marketDate = marketDates.sort().at(-1) || "";
+    if (!marketDate) {
+      throw new KisApiError("KIS 국내주식 일자별 시세에 영업일이 없습니다.", {
+        code: "KIS_QUOTE_MARKET_DATE_MISSING"
+      });
+    }
+    // A current business date is a market-wide fact for a route. Cache only
+    // today's confirmed value; a stale/holiday response is never reused so
+    // each instrument continues to fail closed independently.
+    if (marketDate === observedBusinessDate) {
+      this.quoteBusinessDateCache.set(cacheKey, marketDate);
+    }
+    return marketDate;
   }
 
   async getQuotes(companies) {
