@@ -887,7 +887,9 @@ async function setupLiveKisEngine(
     marketDate = "20260720",
     sufficient = true,
     capitalLimitKrw = 100_000,
-    accountCashKrw = 100_000
+    accountCashKrw = 100_000,
+    quoteObservedAt = NOW.toISOString(),
+    engineNow = () => NOW
   } = {}
 ) {
   const rootDir = await mkdtemp(path.join(os.tmpdir(), "longview-live-safety-"));
@@ -942,7 +944,7 @@ async function setupLiveKisEngine(
         currency: "KRW",
         price: item.marketData.price,
         current: true,
-        asOf: NOW.toISOString(),
+        asOf: quoteObservedAt,
         marketDate
       })),
     getAccount: async () => ({
@@ -990,7 +992,7 @@ async function setupLiveKisEngine(
     stateStore,
     broker,
     client: { getSignal: async () => structuredClone(sourceSignal) },
-    now: () => NOW
+    now: engineNow
   });
   return {
     engine,
@@ -1022,6 +1024,23 @@ test("실전 KIS는 오늘 영업일이 아닌 현재가로 주문 계획을 만
   assert.ok(
     plan.risk.quoteIssues.some((issue) => issue.code === "broker_market_date_stale")
   );
+});
+
+test("실전 KIS는 계획 시작 뒤 도착한 현재가를 미래 시세로 오판하지 않는다", async (t) => {
+  let clockCalls = 0;
+  const { engine } = await setupLiveKisEngine(t, {
+    quoteObservedAt: new Date(NOW.getTime() + 5_000).toISOString(),
+    engineNow: () => {
+      const value = new Date(NOW.getTime() + (clockCalls === 0 ? 0 : 10_000));
+      clockCalls += 1;
+      return value;
+    }
+  });
+
+  const plan = await engine.plan({ liveConfirmation: true });
+  assert.equal(plan.ok, true);
+  assert.equal(plan.portfolio.status, "ready");
+  assert.ok(plan.orders.length > 0);
 });
 
 test("실전 매수는 미수 없는 매수가능수량 확인을 통과해야만 전송된다", async (t) => {
