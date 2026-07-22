@@ -41,6 +41,7 @@ function initialState(startingCashKrw) {
       lastSnapshotRevision: null,
       lastPlanAt: null,
       candidateCount: null,
+      candidateCountScope: null,
       removalStreaks: {},
       managedSecurities: {},
       pendingManagedSecurities: {},
@@ -67,6 +68,16 @@ function validateState(state) {
   }
   if (!Array.isArray(state.strategy.completedCycleKeys || [])) {
     throw new Error("자동매매 중복방지 상태가 올바르지 않습니다.");
+  }
+  if (!("candidateCountScope" in state.strategy)) {
+    state.strategy.candidateCountScope = null;
+  }
+  if (
+    state.strategy.candidateCountScope !== null &&
+    (typeof state.strategy.candidateCountScope !== "string" ||
+      state.strategy.candidateCountScope.length > 256)
+  ) {
+    throw new Error("자동매매 후보 수 기준 상태가 올바르지 않습니다.");
   }
   if (!("pendingManagedSecurities" in state.strategy)) {
     state.strategy.pendingManagedSecurities = {};

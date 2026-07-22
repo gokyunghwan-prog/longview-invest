@@ -46,8 +46,20 @@ export function buildCycleKey({
   return createHash("sha256").update(raw).digest("hex").slice(0, 24);
 }
 
+export function candidateCountForSignal(signal) {
+  if (Array.isArray(signal?.candidateSummaries)) return signal.candidateSummaries.length;
+  if (Array.isArray(signal?.candidates)) return signal.candidates.length;
+  if (Array.isArray(signal?.companies)) return signal.companies.length;
+  return null;
+}
+
 export function assessSignal(signal, config, { now = new Date(), previous = null } = {}) {
   const reasons = [];
+  const candidateCount = candidateCountForSignal(signal);
+  const candidateCountScope = [
+    String(signal?.modelVersion || ""),
+    String(config?.strategy?.version || "")
+  ].join("\u0000");
   if (!signal || typeof signal !== "object") reasons.push("신호 응답이 없습니다.");
   if (signal?.health?.dataLoadStatus !== "ok") reasons.push("Longview 데이터 상태가 정상이 아닙니다.");
   if (signal?.modelVersion !== config.strategy.approvedModelVersion) {
@@ -63,15 +75,28 @@ export function assessSignal(signal, config, { now = new Date(), previous = null
   if (!signal?.revision) reasons.push("신호 revision이 없습니다.");
   if (!Array.isArray(signal?.companies)) reasons.push("후보 회사 목록이 없습니다.");
 
+  const approvedLegacyCandidateMigration =
+    previous?.candidateCount === 3 &&
+    previous?.candidateCountScope == null &&
+    candidateCount === 12 &&
+    signal?.modelVersion === "2.0.0" &&
+    config?.strategy?.version === "longview-domestic-capital-aware-v2";
   if (
     previous?.candidateCount > 0 &&
-    Array.isArray(signal?.companies) &&
-    Math.abs(signal.companies.length - previous.candidateCount) / previous.candidateCount > 0.3
+    candidateCount !== null &&
+    Math.abs(candidateCount - previous.candidateCount) / previous.candidateCount > 0.3 &&
+    !approvedLegacyCandidateMigration
   ) {
     reasons.push("후보 수가 직전 실행보다 30% 넘게 변했습니다.");
   }
 
-  return { ok: reasons.length === 0, reasons, sourceUpdatedAt };
+  return {
+    ok: reasons.length === 0,
+    reasons,
+    sourceUpdatedAt,
+    candidateCount,
+    candidateCountScope
+  };
 }
 
 export function assessOrders(

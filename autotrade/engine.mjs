@@ -5,7 +5,13 @@ import path from "node:path";
 import { LongviewClient } from "./longview-client.mjs";
 import { planMonthlyRebalance } from "./planner.mjs";
 import { orderStatusIsTerminal, reconcileOrderIntents } from "./reconciliation.mjs";
-import { assessOrders, assessSignal, buildCycleKey, redactSensitive } from "./risk.mjs";
+import {
+  assessOrders,
+  assessSignal,
+  buildCycleKey,
+  candidateCountForSignal,
+  redactSensitive
+} from "./risk.mjs";
 import {
   portfolioSecurityKey,
   selectBalancedPortfolio,
@@ -325,15 +331,15 @@ async function fileExists(file) {
   }
 }
 
-function signalSummary(signal) {
+function signalSummary(signal, candidateCountScope = null) {
   return {
     revision: signal.revision,
     rawRevision: signal.rawRevision,
     modelVersion: signal.modelVersion,
     sourceUpdatedAt: signal.sourceUpdatedAt,
     fetchedAt: signal.fetchedAt,
-    candidateCount:
-      signal.candidateSummaries?.length ?? signal.candidates?.length ?? signal.companies.length
+    candidateCount: candidateCountForSignal(signal),
+    candidateCountScope
   };
 }
 
@@ -498,7 +504,10 @@ export class TradingEngine {
     }
     const signalRisk = assessSignal(signal, this.config, {
       now,
-      previous: { candidateCount: state.strategy.candidateCount }
+      previous: {
+        candidateCount: state.strategy.candidateCount,
+        candidateCountScope: state.strategy.candidateCountScope
+      }
     });
     blockedReasons.push(...signalRisk.reasons);
 
@@ -631,7 +640,7 @@ export class TradingEngine {
 
     return {
       ok: blockedReasons.length === 0,
-      signal: signalSummary(signal),
+      signal: signalSummary(signal, signalRisk.candidateCountScope),
       account,
       portfolio,
       planner: planned,
@@ -1235,6 +1244,7 @@ export class TradingEngine {
     await this.stateStore.update(
       (state) => {
         const nextStrategy = completed ? result.planner?.nextState?.strategy || {} : {};
+        const signalBaselineAccepted = result.risk?.signal?.ok === true;
         const retainedKeys = new Set(
           (result.account?.positions || []).map(portfolioSecurityKey)
         );
@@ -1291,7 +1301,13 @@ export class TradingEngine {
           ...state.strategy,
           ...nextStrategy,
           lastSnapshotRevision: result.signal?.revision || state.strategy.lastSnapshotRevision,
-          candidateCount: result.signal?.candidateCount ?? state.strategy.candidateCount,
+          candidateCount: signalBaselineAccepted
+            ? result.signal?.candidateCount ?? state.strategy.candidateCount
+            : state.strategy.candidateCount,
+          candidateCountScope:
+            signalBaselineAccepted
+              ? result.signal?.candidateCountScope ?? state.strategy.candidateCountScope
+              : state.strategy.candidateCountScope,
           managedSecurities: {
             ...retainedManaged,
             ...confirmedPending,
