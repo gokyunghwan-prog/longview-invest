@@ -1398,10 +1398,16 @@ export class KisBroker {
     };
   }
 
-  async placeOrders(orders, { beforeEach = null, afterEach = null } = {}) {
+  async placeOrders(
+    orders,
+    { beforeEach = null, beforeSubmit = null, afterEach = null } = {}
+  ) {
     if (!Array.isArray(orders)) throw new TypeError("주문 목록은 배열이어야 합니다.");
     if (beforeEach !== null && typeof beforeEach !== "function") {
       throw new TypeError("KIS 주문 직전 안전 확인 함수가 올바르지 않습니다.");
+    }
+    if (beforeSubmit !== null && typeof beforeSubmit !== "function") {
+      throw new TypeError("KIS 주문 전송 직전 안전 확인 함수가 올바르지 않습니다.");
     }
     if (afterEach !== null && typeof afterEach !== "function") {
       throw new TypeError("KIS 주문 직후 체크포인트 함수가 올바르지 않습니다.");
@@ -1420,6 +1426,25 @@ export class KisBroker {
               status: "blocked",
               reason,
               errorCode: cleanText(error?.code) || "KIS_PRE_ORDER_CHECK_FAILED",
+              notSent: true
+            });
+          }
+          break;
+        }
+      }
+      if (beforeSubmit) {
+        try {
+          await beforeSubmit(order, index);
+        } catch (error) {
+          const reason = this._safeMessage(
+            error?.message || "KIS 주문 전송 직전 안전 확인 실패"
+          );
+          for (const remaining of orders.slice(index)) {
+            results.push({
+              ...remaining,
+              status: "blocked",
+              reason,
+              errorCode: cleanText(error?.code) || "KIS_PRE_SUBMIT_CHECK_FAILED",
               notSent: true
             });
           }

@@ -89,7 +89,7 @@ jobs:
       - name: Validate the runner and its safety contracts
         run: |
           node --check scripts/cloud-autotrade.mjs
-          node --test tests/autotrade-cloud-state.test.mjs tests/autotrade-cloud-runner.test.mjs tests/autotrade-engine.test.mjs tests/autotrade-kis.test.mjs tests/autotrade-planner.test.mjs tests/autotrade-reconciliation.test.mjs tests/autotrade-risk.test.mjs tests/autotrade-strategy.test.mjs
+          node --test tests/autotrade-cloud-state.test.mjs tests/autotrade-cloud-runner.test.mjs tests/autotrade-engine.test.mjs tests/autotrade-kis.test.mjs tests/autotrade-planner.test.mjs tests/autotrade-reconciliation.test.mjs tests/autotrade-risk.test.mjs tests/autotrade-state-paper.test.mjs tests/autotrade-strategy.test.mjs tests/autotrade-trusted-clock.test.mjs
 
       - name: Start the read-only Longview ranking API
         run: |

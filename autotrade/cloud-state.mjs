@@ -1,4 +1,4 @@
-import { createCipheriv, createDecipheriv, randomBytes } from "node:crypto";
+import { createCipheriv, createDecipheriv, randomBytes, randomUUID } from "node:crypto";
 
 export const CLOUD_STATE_ENVELOPE_VERSION = 1;
 export const CLOUD_STATE_ALGORITHM = "AES-256-GCM";
@@ -473,6 +473,34 @@ export class GitHubEncryptedStateStore {
       "X-GitHub-Api-Version": GITHUB_API_VERSION,
       "User-Agent": "longview-encrypted-cloud-state"
     };
+  }
+
+  async sampleServerTime() {
+    const url = this.repositoryUrl();
+    url.searchParams.set("_longview_clock", randomUUID());
+    const response = await this.request(url, {
+      method: "GET",
+      headers: { ...this.headers(), "Cache-Control": "no-cache" },
+      redirect: "error",
+      cache: "no-store"
+    });
+    try {
+      if (!response || !Number.isInteger(response.status)) {
+        throw new CloudStateError("GitHub time response was invalid.", {
+          code: "CLOUD_STATE_RESPONSE_INVALID"
+        });
+      }
+      const dateHeader = response.headers?.get?.("date");
+      const ageHeader = response.headers?.get?.("age");
+      return {
+        status: response.status,
+        dateHeader: typeof dateHeader === "string" ? dateHeader : null,
+        ageHeader: typeof ageHeader === "string" ? ageHeader : null,
+        redirected: response.redirected === true
+      };
+    } finally {
+      cancelBody(response);
+    }
   }
 
   async request(url, options) {

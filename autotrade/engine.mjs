@@ -54,12 +54,37 @@ function kstTradingClock(value) {
   };
 }
 
-function liveOrderWindowIsOpen(value) {
-  const clock = kstTradingClock(value);
+function normalizedTimeBounds(value, fallback) {
+  const source = value && typeof value === "object"
+    ? value
+    : { earliest: fallback, latest: fallback };
+  const earliest = source.earliest instanceof Date
+    ? new Date(source.earliest)
+    : new Date(source.earliest ?? fallback);
+  const latest = source.latest instanceof Date
+    ? new Date(source.latest)
+    : new Date(source.latest ?? fallback);
+  if (
+    Number.isNaN(earliest.getTime()) ||
+    Number.isNaN(latest.getTime()) ||
+    earliest.getTime() > latest.getTime()
+  ) {
+    const error = new Error("신뢰 시각 범위가 올바르지 않아 실전 주문을 중단했습니다.");
+    error.code = "TRUSTED_CLOCK_BOUNDS_INVALID";
+    throw error;
+  }
+  return { earliest, latest };
+}
+
+function liveOrderWindowBoundsAreOpen(bounds) {
+  const earliest = kstTradingClock(bounds.earliest);
+  const latest = kstTradingClock(bounds.latest);
   return (
-    !["Sat", "Sun"].includes(clock.weekday) &&
-    clock.minute >= LIVE_ORDER_WINDOW_START_MINUTE_KST &&
-    clock.minute <= LIVE_ORDER_WINDOW_END_MINUTE_KST
+    earliest.businessDate === latest.businessDate &&
+    !["Sat", "Sun"].includes(earliest.weekday) &&
+    !["Sat", "Sun"].includes(latest.weekday) &&
+    earliest.minute >= LIVE_ORDER_WINDOW_START_MINUTE_KST &&
+    latest.minute <= LIVE_ORDER_WINDOW_END_MINUTE_KST
   );
 }
 
@@ -444,8 +469,22 @@ function managedAccount(account, state, config, now) {
 export class TradingEngine {
   constructor(
     config,
-    { client, stateStore, broker, now = () => new Date(), beforeOrder = null } = {}
+    {
+      client,
+      stateStore,
+      broker,
+      now = () => new Date(),
+      timeBounds = null,
+      beforePersist = null,
+      beforeOrder = null
+    } = {}
   ) {
+    if (timeBounds !== null && typeof timeBounds !== "function") {
+      throw new TypeError("신뢰 시각 범위 확인은 함수여야 합니다.");
+    }
+    if (beforePersist !== null && typeof beforePersist !== "function") {
+      throw new TypeError("주문 의도 저장 전 원격 안전 확인은 함수여야 합니다.");
+    }
     if (beforeOrder !== null && typeof beforeOrder !== "function") {
       throw new TypeError("주문 직전 원격 안전 확인은 함수여야 합니다.");
     }
@@ -454,8 +493,18 @@ export class TradingEngine {
     this.stateStore = stateStore;
     this.broker = broker;
     this.now = now;
+    this.timeBounds = timeBounds;
+    this.beforePersist = beforePersist;
     this.beforeOrder = beforeOrder;
     this.killSwitchFile = path.join(config.stateDir, "KILL_SWITCH");
+  }
+
+  currentTimeBounds() {
+    const fallback = this.now();
+    return normalizedTimeBounds(
+      this.timeBounds ? this.timeBounds() : null,
+      fallback
+    );
   }
 
   async status() {
@@ -492,7 +541,7 @@ export class TradingEngine {
       );
     }
     const liveKisOrder = this.config.mode === "live" && this.broker.name === "kis";
-    if (liveKisOrder && !liveOrderWindowIsOpen(now)) {
+    if (liveKisOrder && !liveOrderWindowBoundsAreOpen(this.currentTimeBounds())) {
       blockedReasons.push("실전 주문 허용시간(평일 09:05~14:50 KST)이 아닙니다.");
     }
 
@@ -668,13 +717,18 @@ export class TradingEngine {
     }
   }
 
-  async assertLivePreOrderSafety(order) {
+  assertLiveOrderWindowOpen() {
     if (this.config.mode !== "live" || this.broker.name !== "kis") return;
-    if (!liveOrderWindowIsOpen(this.now())) {
+    if (!liveOrderWindowBoundsAreOpen(this.currentTimeBounds())) {
       const error = new Error("실전 주문 허용시간이 지나 주문을 중단했습니다.");
       error.code = "LIVE_ORDER_WINDOW_CLOSED";
       throw error;
     }
+  }
+
+  async assertLivePreOrderSafety(order) {
+    this.assertLiveOrderWindowOpen();
+    if (this.config.mode !== "live" || this.broker.name !== "kis") return;
     if (String(order?.side || "").toLowerCase() !== "buy") return;
     if (typeof this.broker.getBuyableOrder !== "function") {
       const error = new Error("KIS 미수 없는 매수가능수량 확인 기능이 없습니다.");
@@ -819,6 +873,8 @@ export class TradingEngine {
     }
 
     await this.assertKillSwitchInactive();
+    if (this.beforePersist) await this.beforePersist(plan);
+    await this.assertKillSwitchInactive();
     await this.assertLivePreOrderSafety(null);
     await this.persistInFlight(plan, trigger);
     let results;
@@ -830,8 +886,15 @@ export class TradingEngine {
       results = await this.broker.placeOrders(plan.orders, {
         beforeEach: async (order, index) => {
           await this.assertKillSwitchInactive();
-          await this.assertLivePreOrderSafety(order);
           if (this.beforeOrder) await this.beforeOrder(order, index, plan);
+          await this.assertKillSwitchInactive();
+          await this.assertLivePreOrderSafety(order);
+        },
+        beforeSubmit: async (order, index) => {
+          await this.assertKillSwitchInactive();
+          if (this.beforeOrder) await this.beforeOrder(order, index, plan);
+          await this.assertKillSwitchInactive();
+          this.assertLiveOrderWindowOpen();
         },
         afterEach: async (result, index) =>
           this.checkpointOrderResult(plan, result, index)
@@ -1353,7 +1416,10 @@ export async function createTradingEngine(config, dependencies = {}) {
   const broker =
     dependencies.broker ||
     (config.broker === "kis"
-      ? new KisBroker(config.kis)
+      ? new KisBroker(
+          config.kis,
+          dependencies.now ? { now: dependencies.now } : undefined
+        )
       : new PaperBroker(stateStore, { feeRate: config.paper.feeRate }));
   return new TradingEngine(config, {
     ...dependencies,
