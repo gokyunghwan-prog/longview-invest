@@ -15,10 +15,12 @@ import {
 import { createTradingEngine } from "../autotrade/engine.mjs";
 import { redactSensitive } from "../autotrade/risk.mjs";
 import { createTradingStateStore } from "../autotrade/state-store.mjs";
+import { createGitHubDateTrustedClock } from "../autotrade/trusted-clock.mjs";
 
 export const CLOUD_LIVE_ACKNOWLEDGEMENT =
   "I_ACCEPT_GITHUB_ACTIONS_LIVE_TRADING";
 export const DEFAULT_CLOUD_LEASE_MS = 20 * 60 * 1_000;
+export const DEFAULT_CLOUD_MUTATION_GUARD_MS = 60_000;
 
 const CLOUD_COMMANDS = new Set(["plan", "trade", "reconcile", "topup-plan", "topup"]);
 const MUTATING_COMMANDS = new Set(["trade", "reconcile", "topup"]);
@@ -71,6 +73,79 @@ function makeLeaseOwner(env) {
     throw new Error("GitHub Actions 실행 식별정보가 없습니다.");
   }
   return `${repository}:${runId}:${attempt}:${randomUUID()}`;
+}
+
+function parseNonNegativeInteger(value, fallback, label) {
+  const resolved = value === undefined || value === null || value === "" ? fallback : value;
+  const parsed = Number(resolved);
+  if (!Number.isSafeInteger(parsed) || parsed < 0) {
+    throw new Error(`${label}은(는) 0 이상의 정수여야 합니다.`);
+  }
+  return parsed;
+}
+
+function normalizedCloudTimeBounds(value, fallback) {
+  const source = value && typeof value === "object"
+    ? value
+    : { earliest: fallback, latest: fallback };
+  const earliest = new Date(source.earliest ?? fallback);
+  const latest = new Date(source.latest ?? fallback);
+  if (
+    Number.isNaN(earliest.getTime()) ||
+    Number.isNaN(latest.getTime()) ||
+    earliest.getTime() > latest.getTime()
+  ) {
+    const error = new Error("신뢰 시각 범위가 올바르지 않습니다.");
+    error.code = "TRUSTED_CLOCK_BOUNDS_INVALID";
+    throw error;
+  }
+  return { earliest, latest };
+}
+
+function exactTimeBounds(now) {
+  const value = now();
+  return normalizedCloudTimeBounds(null, value);
+}
+
+async function resolveCloudClock({ now, trustedClock, remote }) {
+  if (now !== null && now !== undefined) {
+    if (typeof now !== "function") throw new TypeError("현재 시각은 함수여야 합니다.");
+    if (trustedClock !== null && trustedClock !== undefined) {
+      throw new TypeError("주입 시각과 신뢰 시계를 동시에 지정할 수 없습니다.");
+    }
+    return {
+      now,
+      bounds: () => exactTimeBounds(now),
+      refresh: async () => exactTimeBounds(now)
+    };
+  }
+
+  const clock = trustedClock || createGitHubDateTrustedClock({
+    sample: async () => {
+      if (typeof remote.sampleServerTime !== "function") {
+        const error = new Error("GitHub API 신뢰 시각 조회 기능이 없습니다.");
+        error.code = "TRUSTED_CLOCK_SAMPLE_UNAVAILABLE";
+        throw error;
+      }
+      return remote.sampleServerTime();
+    }
+  });
+  if (
+    !clock ||
+    typeof clock.refresh !== "function" ||
+    typeof clock.now !== "function" ||
+    typeof clock.bounds !== "function"
+  ) {
+    const error = new Error("GitHub API 신뢰 시계 구현이 올바르지 않습니다.");
+    error.code = "TRUSTED_CLOCK_IMPLEMENTATION_INVALID";
+    throw error;
+  }
+  await clock.refresh();
+  return {
+    now: () => clock.now(),
+    bounds: () => clock.bounds(),
+    refresh: () => clock.refresh()
+  };
 }
 
 export function assertCloudLiveAuthorization(command, config, env = process.env) {
@@ -137,13 +212,22 @@ async function writeStateAtomically(stateFile, state) {
 
 export async function acquireCloudLease(
   stateStore,
-  { owner, now = () => new Date(), leaseMs = DEFAULT_CLOUD_LEASE_MS } = {}
+  {
+    owner,
+    now = () => new Date(),
+    timeBounds = null,
+    leaseMs = DEFAULT_CLOUD_LEASE_MS
+  } = {}
 ) {
   const normalizedOwner = String(owner || "").trim();
   if (!normalizedOwner) throw new Error("클라우드 lease 소유자 식별자가 없습니다.");
   const duration = parsePositiveInteger(leaseMs, DEFAULT_CLOUD_LEASE_MS, "클라우드 lease 시간");
   const acquiredAt = now();
-  const expiresAt = new Date(acquiredAt.getTime() + duration);
+  const bounds = normalizedCloudTimeBounds(
+    timeBounds ? timeBounds() : null,
+    acquiredAt
+  );
+  const expiresAt = new Date(bounds.latest.getTime() + duration);
   let lease;
   await stateStore.update(
     (state) => {
@@ -154,7 +238,7 @@ export async function acquireCloudLease(
         current &&
         current.owner !== normalizedOwner &&
         Number.isFinite(currentExpiry) &&
-        currentExpiry > acquiredAt.getTime()
+        currentExpiry > bounds.earliest.getTime()
       ) {
         const error = new Error("다른 클라우드 자동투자 실행이 lease를 보유하고 있습니다.");
         error.code = "CLOUD_LEASE_BUSY";
@@ -175,13 +259,28 @@ export async function acquireCloudLease(
   return structuredClone(lease);
 }
 
-export function assertCloudLeaseOwned(stateStore, lease, now = () => new Date()) {
+export function assertCloudLeaseOwned(
+  stateStore,
+  lease,
+  now = () => new Date(),
+  { timeBounds = null, minimumRemainingMs = 0 } = {}
+) {
   const current = stateStore.snapshot().cloud?.lease;
+  const checkedAt = now();
+  const bounds = normalizedCloudTimeBounds(
+    timeBounds ? timeBounds() : null,
+    checkedAt
+  );
+  const remainingGuard = parseNonNegativeInteger(
+    minimumRemainingMs,
+    0,
+    "클라우드 lease 최소 잔여시간"
+  );
   if (
     !current ||
     current.owner !== lease.owner ||
     current.fence !== lease.fence ||
-    Date.parse(current.expiresAt || "") <= now().getTime()
+    Date.parse(current.expiresAt || "") <= bounds.latest.getTime() + remainingGuard
   ) {
     const error = new Error("클라우드 자동투자 lease가 만료되었거나 소유권이 변경되었습니다.");
     error.code = "CLOUD_LEASE_LOST";
@@ -268,7 +367,8 @@ async function reconcile(engine, options) {
 export async function runCloudAutotrade({
   command: requestedCommand = "plan",
   env = process.env,
-  now = () => new Date(),
+  now = null,
+  trustedClock = null,
   config = null,
   cloudStore = null,
   engineFactory = createTradingEngine,
@@ -290,6 +390,9 @@ export async function runCloudAutotrade({
       encryptionKey: stateKey
     });
 
+  const cloudClock = await resolveCloudClock({ now, trustedClock, remote });
+  const resolvedNow = cloudClock.now;
+
   await remote.ensureBranch();
   const loaded = await remote.load();
   let remoteSha = loaded.sha;
@@ -310,7 +413,7 @@ export async function runCloudAutotrade({
   }
   stateStore = await stateStoreFactory(resolvedConfig.stateDir, {
     startingCashKrw: resolvedConfig.paper?.startingCashKrw,
-    now,
+    now: resolvedNow,
     onStateCommitted: persistRemote
   });
   if (!loaded.exists) {
@@ -324,7 +427,8 @@ export async function runCloudAutotrade({
   const owner = makeLeaseOwner(env);
   const lease = await acquireCloudLease(stateStore, {
     owner,
-    now,
+    now: resolvedNow,
+    timeBounds: cloudClock.bounds,
     leaseMs: parsePositiveInteger(
       env.AUTOTRADE_CLOUD_LEASE_MS,
       DEFAULT_CLOUD_LEASE_MS,
@@ -333,18 +437,25 @@ export async function runCloudAutotrade({
   });
   let primaryError = null;
   try {
-    const beforeOrder = async () => {
-      assertCloudLeaseOwned(stateStore, lease, now);
+    const refreshMutationFence = async () => {
+      await cloudClock.refresh();
       await remote.assertUnchanged(remoteSha);
+      assertCloudLeaseOwned(stateStore, lease, resolvedNow, {
+        timeBounds: cloudClock.bounds,
+        minimumRemainingMs: DEFAULT_CLOUD_MUTATION_GUARD_MS
+      });
     };
     const engine = await engineFactory(resolvedConfig, {
       stateStore,
-      now,
-      beforeOrder
+      now: resolvedNow,
+      timeBounds: cloudClock.bounds,
+      beforePersist: refreshMutationFence,
+      beforeOrder: refreshMutationFence
     });
 
     let summary;
     if (command === "plan" || command === "topup-plan") {
+      await cloudClock.refresh();
       // plan never submits broker orders. Passing the confirmation flag here
       // only lets the same live-order risk rules validate the proposed plan.
       summary = executionSummary(
@@ -361,6 +472,7 @@ export async function runCloudAutotrade({
         )
       );
     } else if (command === "trade" || command === "topup") {
+      await cloudClock.refresh();
       const previous = await reconcile(engine, {
         trigger: "github-actions-pretrade",
         cancelOpenOrders: false
@@ -377,6 +489,7 @@ export async function runCloudAutotrade({
           reconciliation: previousSummary
         };
       } else {
+        await cloudClock.refresh();
         const result = await engine.execute(
           command === "topup"
             ? {
@@ -394,6 +507,7 @@ export async function runCloudAutotrade({
         summary = executionSummary(command, result, previousSummary);
       }
     } else {
+      await cloudClock.refresh();
       const result = await reconcile(engine, {
         trigger: "github-actions-reconcile",
         cancelOpenOrders: true
@@ -418,6 +532,7 @@ export async function runCloudAutotrade({
     throw error;
   } finally {
     try {
+      await cloudClock.refresh();
       await releaseCloudLease(stateStore, lease);
     } catch (releaseError) {
       if (!primaryError) throw releaseError;

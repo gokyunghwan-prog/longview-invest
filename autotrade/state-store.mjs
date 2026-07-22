@@ -27,11 +27,12 @@ function processIsAlive(pid) {
   }
 }
 
-function initialState(startingCashKrw) {
+function initialState(startingCashKrw, now) {
+  const createdAt = now().toISOString();
   return {
     schemaVersion: 1,
-    createdAt: new Date().toISOString(),
-    updatedAt: new Date().toISOString(),
+    createdAt,
+    updatedAt: createdAt,
     paper: {
       cashKrw: startingCashKrw,
       positions: {},
@@ -138,6 +139,7 @@ export class TradingStateStore {
     {
       startingCashKrw = 10_000_000,
       now = () => new Date(),
+      lockNow = Date.now,
       pid = process.pid,
       isProcessAlive = processIsAlive,
       orphanGraceMs = RUN_LOCK_ORPHAN_GRACE_MS,
@@ -154,6 +156,10 @@ export class TradingStateStore {
     this.runLockOwnerFile = path.join(this.runLockDirectory, "owner.json");
     this.startingCashKrw = startingCashKrw;
     this.now = now;
+    if (typeof lockNow !== "function") {
+      throw new TypeError("실행 잠금 시각은 함수여야 합니다.");
+    }
+    this.lockNow = lockNow;
     this.pid = pid;
     this.isProcessAlive = isProcessAlive;
     this.orphanGraceMs = orphanGraceMs;
@@ -168,7 +174,7 @@ export class TradingStateStore {
       await this.reload();
     } catch (error) {
       if (error?.code !== "ENOENT") throw error;
-      this.state = initialState(this.startingCashKrw);
+      this.state = initialState(this.startingCashKrw, this.now);
       await writeAtomic(this.stateFile, this.state);
     }
     return this;
@@ -236,7 +242,14 @@ export class TradingStateStore {
       if (error?.code === "ENOENT") return { owner: null, recoverable: true };
       throw error;
     }
-    const age = Math.max(0, this.now().getTime() - details.mtimeMs);
+    const lockTimestamp = Number(this.lockNow());
+    if (!Number.isFinite(lockTimestamp)) {
+      throw new Error("실행 잠금 시각이 올바르지 않습니다.");
+    }
+    // Filesystem mtime is written with the host wall clock. Keep stale-lock
+    // recovery in that same clock domain even when durable trading timestamps
+    // use a remote trusted clock.
+    const age = Math.max(0, lockTimestamp - details.mtimeMs);
     return { owner: null, recoverable: age >= this.orphanGraceMs };
   }
 
