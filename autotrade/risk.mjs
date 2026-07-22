@@ -24,8 +24,23 @@ export function redactSensitive(value, secrets = []) {
     .slice(0, 1_000);
 }
 
-export function buildCycleKey({ signalRevision, modelVersion, strategyVersion, period, accountId }) {
-  const raw = [signalRevision, modelVersion, strategyVersion, period, accountId]
+export function buildCycleKey({
+  signalRevision,
+  modelVersion,
+  strategyVersion,
+  period,
+  accountId,
+  scope = ""
+}) {
+  const normalizedScope = String(scope || "").trim();
+  // A confirmed one-shot operation must stay idempotent even if a later
+  // workflow re-run observes a new signal revision, model, or KST period.
+  // Bind its key only to the account and explicit scope. Keep the legacy
+  // five-field byte sequence unchanged for normal scheduled cycles.
+  const parts = normalizedScope
+    ? ["scoped-cycle-v1", accountId, normalizedScope]
+    : [signalRevision, modelVersion, strategyVersion, period, accountId];
+  const raw = parts
     .map((item) => String(item || ""))
     .join("\u0000");
   return createHash("sha256").update(raw).digest("hex").slice(0, 24);

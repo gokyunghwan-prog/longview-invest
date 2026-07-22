@@ -80,6 +80,15 @@ function accountIdentity(config) {
   return createHash("sha256").update(raw).digest("hex").slice(0, 16);
 }
 
+function normalizedCycleScope(value) {
+  const scope = String(value || "").trim();
+  if (!scope) return "";
+  if (!/^[a-z0-9][a-z0-9:._-]{7,95}$/i.test(scope)) {
+    throw new TypeError("수동 실행 식별자 형식이 올바르지 않습니다.");
+  }
+  return scope;
+}
+
 function quoteKey(company) {
   return `${String(company.country || "").toUpperCase()}:${String(company.ticker || "").toUpperCase()}`;
 }
@@ -392,17 +401,28 @@ function managedAccount(account, state, config, now) {
   );
   const actualEquity = finite(Number(account.totalEquityKrw)) || 0;
   const actualCash = finite(Number(account.cashKrw)) || 0;
-  const managedEquity = actualCash + managedValue;
+  const allPositionsValue = positions.reduce(
+    (sum, position) => sum + (finite(Number(position.marketValueKrw)) || 0),
+    0
+  );
+  // KIS can keep today's filled purchases inside the deposit field until
+  // settlement. Bound spendable cash by total equity minus all holdings so
+  // same-day fills are never counted once as cash and again as a position.
+  const equityBackedCash =
+    actualEquity > 0 ? Math.max(0, actualEquity - allPositionsValue) : actualCash;
+  const spendableCash = Math.min(actualCash, equityBackedCash);
+  const managedEquity = spendableCash + managedValue;
   const limit = config.risk.capitalLimitKrw > 0 ? config.risk.capitalLimitKrw : managedEquity;
   const totalEquityKrw = Math.min(managedEquity, limit);
   const cashKrw = Math.min(
-    actualCash,
+    spendableCash,
     Math.max(0, totalEquityKrw - managedValue)
   );
   return {
     account: {
       ...account,
       actualTotalEquityKrw: actualEquity,
+      reportedCashKrw: actualCash,
       managedEquityKrw: managedEquity,
       totalEquityKrw,
       cashKrw,
@@ -442,10 +462,22 @@ export class TradingEngine {
     };
   }
 
-  async plan({ force = false, liveConfirmation = false } = {}) {
+  async plan({
+    force = false,
+    liveConfirmation = false,
+    cycleScope = "",
+    cashDeploymentOnly = false
+  } = {}) {
     if (typeof this.stateStore.reload === "function") await this.stateStore.reload();
     const now = this.now();
     const state = this.stateStore.snapshot();
+    const resolvedCycleScope = normalizedCycleScope(cycleScope);
+    if (cashDeploymentOnly && !resolvedCycleScope) {
+      throw new Error("추가입금 실행에는 일회성 실행 식별자가 필요합니다.");
+    }
+    if (resolvedCycleScope && !cashDeploymentOnly) {
+      throw new Error("수동 실행 식별자는 추가입금 매수전용 실행에서만 사용할 수 있습니다.");
+    }
     const blockedReasons = [];
     if (await fileExists(this.killSwitchFile)) blockedReasons.push("긴급 정지 스위치가 켜져 있습니다.");
     if (state.strategy.inFlight) {
@@ -521,6 +553,14 @@ export class TradingEngine {
       : selectBalancedPortfolio(portfolioOptions);
     if (portfolio.status !== "ready") blockedReasons.push(...portfolio.blockedReasons);
 
+    const cashDeploymentTurnoverWeight =
+      cashDeploymentOnly && account.totalEquityKrw > 0
+        ? Math.min(1, account.cashKrw / account.totalEquityKrw)
+        : null;
+    const plannerTurnoverWeight =
+      cashDeploymentTurnoverWeight ?? this.config.risk.maximumTurnoverWeight;
+    const plannerInitialTurnoverWeight =
+      cashDeploymentTurnoverWeight ?? this.config.risk.initialDeploymentTurnoverWeight;
     const planned = planMonthlyRebalance({
       portfolio,
       account,
@@ -530,10 +570,10 @@ export class TradingEngine {
         risk: {
           ...this.config.risk,
           maximumTurnoverWeight:
-            this.config.risk.maximumTurnoverWeight /
+            plannerTurnoverWeight /
             (1 + this.config.risk.limitPriceBuffer),
           initialDeploymentTurnoverWeight:
-            this.config.risk.initialDeploymentTurnoverWeight /
+            plannerInitialTurnoverWeight /
             (1 + this.config.risk.limitPriceBuffer),
           // A KIS order acknowledgement is not a fill confirmation. Do not
           // finance follow-up buys with projected sell proceeds; the next
@@ -542,7 +582,8 @@ export class TradingEngine {
         }
       },
       now,
-      force
+      force: force || cashDeploymentOnly,
+      cashDeploymentOnly
     });
     if (planned.status === "blocked") {
       blockedReasons.push(planned.diagnostics?.reason || "주문계획을 만들 수 없습니다.");
@@ -553,7 +594,8 @@ export class TradingEngine {
       modelVersion: signal.modelVersion,
       strategyVersion: this.config.strategy.version,
       period: rebalancePeriodKst(now, this.config.strategy.rebalanceFrequency),
-      accountId: accountIdentity(this.config)
+      accountId: accountIdentity(this.config),
+      scope: resolvedCycleScope
     });
     const existingCycleKeys = new Set(state.strategy.completedCycleKeys || []);
     orders = orders.map((order, index) => ({
@@ -574,9 +616,10 @@ export class TradingEngine {
       risk: {
         ...this.config.risk,
         maximumTurnoverWeight:
-          planned.diagnostics?.deploymentPhase === "initial"
+          cashDeploymentTurnoverWeight ??
+          (planned.diagnostics?.deploymentPhase === "initial"
             ? this.config.risk.initialDeploymentTurnoverWeight
-            : this.config.risk.maximumTurnoverWeight
+            : this.config.risk.maximumTurnoverWeight)
       }
     };
     const orderRisk = assessOrders(orders, account, orderRiskConfig, {
@@ -730,10 +773,21 @@ export class TradingEngine {
     });
   }
 
-  async executeLocked({ force = false, liveConfirmation = false, trigger = "manual" } = {}) {
+  async executeLocked({
+    force = false,
+    liveConfirmation = false,
+    trigger = "manual",
+    cycleScope = "",
+    cashDeploymentOnly = false
+  } = {}) {
     let plan;
     try {
-      plan = await this.plan({ force, liveConfirmation });
+      plan = await this.plan({
+        force,
+        liveConfirmation,
+        cycleScope,
+        cashDeploymentOnly
+      });
     } catch (error) {
       const safeError = redactSensitive(error, [
         this.config.kis.appKey,
