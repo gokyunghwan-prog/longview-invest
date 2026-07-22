@@ -11,6 +11,8 @@ const TOKEN_EXPIRY_SKEW_MS = 60_000;
 const DOMESTIC_BALANCE_PATH = "/uapi/domestic-stock/v1/trading/inquire-balance";
 const DOMESTIC_ORDER_PATH = "/uapi/domestic-stock/v1/trading/order-cash";
 const DOMESTIC_QUOTE_PATH = "/uapi/domestic-stock/v1/quotations/inquire-price";
+const DOMESTIC_DAILY_PRICE_PATH =
+  "/uapi/domestic-stock/v1/quotations/inquire-daily-price";
 const DOMESTIC_BUYABLE_PATH = "/uapi/domestic-stock/v1/trading/inquire-psbl-order";
 const DOMESTIC_DAILY_ORDERS_PATH = "/uapi/domestic-stock/v1/trading/inquire-daily-ccld";
 const DOMESTIC_CANCELABLE_ORDERS_PATH =
@@ -873,6 +875,30 @@ export class KisBroker {
         code: "KIS_QUOTE_MISSING"
       });
     }
+    // The official inquire-price response does not include a business date.
+    // Confirm it independently with the official daily-price endpoint instead
+    // of treating the runner clock as proof that the quote belongs to today.
+    const dailyPayload = await this._request(DOMESTIC_DAILY_PRICE_PATH, {
+      trId: "FHKST01010400",
+      query: {
+        FID_COND_MRKT_DIV_CODE: marketCode,
+        FID_INPUT_ISCD: ticker,
+        FID_PERIOD_DIV_CODE: "D",
+        FID_ORG_ADJ_PRC: "1"
+      }
+    });
+    const marketDates = asRows(dailyPayload.output)
+      .map((row) => cleanText(row.stck_bsop_date))
+      .filter((value) => /^\d{8}$/.test(value));
+    for (const marketDate of marketDates) {
+      dailyOrderQueryDate(marketDate, "KIS 시세 영업일");
+    }
+    const marketDate = marketDates.sort().at(-1) || "";
+    if (!marketDate) {
+      throw new KisApiError("KIS 국내주식 일자별 시세에 영업일이 없습니다.", {
+        code: "KIS_QUOTE_MARKET_DATE_MISSING"
+      });
+    }
     const observedAt = new Date(this._now()).toISOString();
     return {
       id: cleanText(instrument.id) || `KR:${ticker}`,
@@ -891,7 +917,7 @@ export class KisBroker {
       change: firstNumber(output, ["prdy_vrss"]),
       changeRate: firstNumber(output, ["prdy_ctrt"]),
       volume: firstNumber(output, ["acml_vol"]),
-      marketDate: cleanText(output.stck_bsop_date),
+      marketDate,
       marketTime: cleanText(output.stck_cntg_hour)
     };
   }
