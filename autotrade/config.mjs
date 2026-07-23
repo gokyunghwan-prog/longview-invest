@@ -177,6 +177,7 @@ export function getTradingConfig({ env = process.env, rootDir = ROOT_DIR, loadEn
         minimum: 1,
         maximum: 100
       }),
+      deployAvailableCash: boolean(env.TRADING_AUTODEPLOY_CASH, false),
       maximumTurnoverWeight: number(env.TRADING_MAX_TURNOVER_PERCENT, 10, {
         minimum: 1,
         maximum: 100
@@ -244,6 +245,23 @@ export function getTradingConfig({ env = process.env, rootDir = ROOT_DIR, loadEn
     }
     if (!config.risk.requireDedicatedAccount) {
       throw new Error("실전 모드는 자동매매 전용 계좌 설정이 필요합니다.");
+    }
+    if (config.risk.deployAvailableCash) {
+      if (config.strategy.reserveWeight !== 0) {
+        throw new Error("실전 가용현금 자동투입은 목표 현금 비중이 0%여야 합니다.");
+      }
+      if (config.risk.capitalLimitKrw !== 0) {
+        throw new Error("실전 가용현금 자동투입은 전용계좌 전체자산 모드가 필요합니다.");
+      }
+      if (
+        !config.live.useAllDedicatedAccountAssets ||
+        config.live.useAllDedicatedAccountAssetsAcknowledgement !==
+          USE_ALL_DEDICATED_ACCOUNT_ASSETS_ACKNOWLEDGEMENT
+      ) {
+        throw new Error(
+          "실전 가용현금 자동투입은 전용계좌 전체자산 별도 잠금 해제가 필요합니다."
+        );
+      }
     }
     if (
       config.risk.capitalLimitKrw === 0 &&

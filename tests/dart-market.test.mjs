@@ -231,6 +231,10 @@ test("다중회사 요청은 공식 최대치인 100개 이하로 분할한다",
   assert.equal(getDartMarketApiLimits().maximumCompaniesPerBatch, 100);
   assert.equal(getDartMarketApiLimits().defaultFinancialBatchSize, 50);
   assert.equal(getDartMarketApiLimits().defaultFinancialTimeoutMs, 60_000);
+  assert.equal(
+    getDartMarketApiLimits().defaultCashFlowEnrichmentMaxDurationMs,
+    45 * 60_000
+  );
 });
 
 test("주요계정은 연결재무제표를 우선하고 사업보고서 3개년 금액을 보존한다", () => {
@@ -1063,6 +1067,435 @@ test("DART 연간 현금흐름은 체크포인트를 재사용해 FCF를 같은 
     );
     assert.equal(cashFlowCalls, 3);
     assert.equal(refreshedFiling.companies[0].financials.latest.freeCashFlow, 45);
+  } finally {
+    await rm(temporary, { recursive: true, force: true });
+  }
+});
+
+function createNoDataCashFlowHarness(companyCount = 1) {
+  const companies = Array.from({ length: companyCount }, (_, index) => {
+    const sequence = String(index + 1).padStart(8, "0");
+    return {
+      corpCode: sequence,
+      stockCode: String(index + 1).padStart(6, "0"),
+      name: `무자료회사${index + 1}`,
+      modifiedAt: "20260701"
+    };
+  });
+  const filingIds = Object.fromEntries(
+    companies.map((company, index) => [
+      company.corpCode,
+      `20260301${String(index + 1).padStart(6, "0")}`
+    ])
+  );
+  let cashFlowCalls = 0;
+  let cashFlowPayload = { status: "013", message: "No data" };
+
+  const fetchCorpCodes = async () => companies.map((company) => ({ ...company }));
+  const fetchJsonImpl = async (url) => {
+    const parsed = new URL(url);
+    const endpoint = parsed.pathname.split("/").at(-1);
+    if (endpoint === "company.json") {
+      const company = companies.find(
+        (entry) => entry.corpCode === parsed.searchParams.get("corp_code")
+      );
+      assert.ok(company);
+      return {
+        status: "000",
+        corp_name: company.name,
+        stock_name: company.name,
+        stock_code: company.stockCode,
+        corp_cls: "Y",
+        induty_code: "100000",
+        acc_mt: "12"
+      };
+    }
+    if (endpoint === "list.json" || endpoint === "fnlttCmpnyIndx.json") {
+      return { status: "013", message: "No data" };
+    }
+    if (endpoint === "fnlttMultiAcnt.json") {
+      return {
+        status: "000",
+        list: companies.flatMap((company, index) => {
+          const common = {
+            stock_code: company.stockCode,
+            corp_code: company.corpCode,
+            fs_div: "CFS",
+            reprt_code: "11011",
+            bsns_year: "2025",
+            currency: "KRW",
+            rcept_no: filingIds[company.corpCode]
+          };
+          return [
+            {
+              ...common,
+              sj_div: "IS",
+              account_nm: "매출액",
+              thstrm_amount: String(100 + index),
+              frmtrm_amount: "90",
+              bfefrmtrm_amount: "80"
+            },
+            {
+              ...common,
+              sj_div: "IS",
+              account_nm: "당기순이익(손실)",
+              thstrm_amount: "10",
+              frmtrm_amount: "9",
+              bfefrmtrm_amount: "8"
+            }
+          ];
+        })
+      };
+    }
+    if (endpoint === "fnlttSinglAcntAll.json") {
+      cashFlowCalls += 1;
+      return structuredClone(cashFlowPayload);
+    }
+    throw new Error("Unexpected endpoint: " + endpoint);
+  };
+
+  return {
+    companies,
+    filingIds,
+    fetchCorpCodes,
+    fetchJsonImpl,
+    getCashFlowCalls: () => cashFlowCalls,
+    setCashFlowPayload: (payload) => {
+      cashFlowPayload = structuredClone(payload);
+    }
+  };
+}
+
+function noDataCashFlowOptions(harness, dataDir, overrides = {}) {
+  return {
+    dataDir,
+    now: new Date("2026-07-17T00:00:00.000Z"),
+    businessYear: "2025",
+    reportCode: "11011",
+    disclosureLookbackDays: 1,
+    minIntervalMs: 0,
+    maxRequests: 200,
+    minimumUniverseCount: harness.companies.length,
+    minimumKospiCount: harness.companies.length,
+    minimumKosdaqCount: 0,
+    enableCashFlowEnrichment: true,
+    fetchCorpCodes: harness.fetchCorpCodes,
+    fetchJsonImpl: harness.fetchJsonImpl,
+    ...overrides
+  };
+}
+
+test("DART 무자료 현금흐름은 공시·TTL이 같으면 재호출하지 않고 변경 시 갱신한다", async () => {
+  const temporary = await mkdtemp(path.join(tmpdir(), "longview-dart-no-cashflow-"));
+  const harness = createNoDataCashFlowHarness();
+  const config = { dartApiKey: "x".repeat(40) };
+  try {
+    const first = await syncDartMarket(
+      config,
+      noDataCashFlowOptions(harness, temporary, { runId: "no-data-first" })
+    );
+    const second = await syncDartMarket(
+      config,
+      noDataCashFlowOptions(harness, temporary, { runId: "no-data-second" })
+    );
+    assert.equal(first.companies[0].financials.latest.operatingCashFlow, null);
+    assert.equal(second.companies[0].financials.latest.operatingCashFlow, null);
+    assert.equal(harness.getCashFlowCalls(), 1);
+
+    const cacheFile = path.join(temporary, "cashflows-2025-11011.json");
+    const cached = JSON.parse(await readFile(cacheFile, "utf8"));
+    assert.equal(cached.schemaVersion, 3);
+    assert.equal(
+      cached.resultMetadataByCorpCode["00000001"].outcome,
+      "NO_DATA"
+    );
+    assert.equal(
+      cached.resultMetadataByCorpCode["00000001"].parserVersion,
+      1
+    );
+    assert.equal(
+      cached.resultMetadataByCorpCode["00000001"].sourceFilingId,
+      harness.filingIds["00000001"]
+    );
+
+    harness.filingIds["00000001"] = "20260302000002";
+    await syncDartMarket(
+      config,
+      noDataCashFlowOptions(harness, temporary, {
+        runId: "no-data-amended",
+        now: new Date("2026-07-18T00:00:00.000Z")
+      })
+    );
+    assert.equal(harness.getCashFlowCalls(), 2);
+
+    await syncDartMarket(
+      config,
+      noDataCashFlowOptions(harness, temporary, {
+        runId: "no-data-expired",
+        now: new Date("2026-07-26T00:00:00.000Z")
+      })
+    );
+    assert.equal(harness.getCashFlowCalls(), 3);
+  } finally {
+    await rm(temporary, { recursive: true, force: true });
+  }
+});
+
+test("손상된 DART 현금흐름 캐시만 초기화하고 전체 동기화를 계속한다", async () => {
+  const temporary = await mkdtemp(path.join(tmpdir(), "longview-dart-bad-cache-"));
+  const harness = createNoDataCashFlowHarness();
+  const config = { dartApiKey: "x".repeat(40) };
+  const cacheFile = path.join(temporary, "cashflows-2025-11011.json");
+  const corruptCaches = [
+    "{not-json",
+    "null",
+    "[]",
+    JSON.stringify({
+      schemaVersion: 3,
+      periodKey: "2025:11011",
+      recordsByCorpCode: []
+    })
+  ];
+  try {
+    for (const [index, corruptCache] of corruptCaches.entries()) {
+      await writeFile(cacheFile, corruptCache, "utf8");
+      const dataset = await syncDartMarket(
+        config,
+        noDataCashFlowOptions(harness, temporary, {
+          runId: `bad-cache-${index}`
+        })
+      );
+      assert.equal(dataset.companies.length, 1);
+      assert.equal(harness.getCashFlowCalls(), index + 1);
+      const repaired = JSON.parse(await readFile(cacheFile, "utf8"));
+      assert.equal(repaired.schemaVersion, 3);
+      assert.equal(Array.isArray(repaired.recordsByCorpCode), false);
+      assert.equal(
+        repaired.resultMetadataByCorpCode["00000001"].outcome,
+        "NO_DATA"
+      );
+      assert.equal(
+        JSON.parse(
+          await readFile(path.join(temporary, "companies.json"), "utf8")
+        ).companies.length,
+        1
+      );
+    }
+  } finally {
+    await rm(temporary, { recursive: true, force: true });
+  }
+});
+
+test("DART 음성 캐시는 완료 true와 원시 null이 모두 정확할 때만 재사용한다", async () => {
+  const temporary = await mkdtemp(path.join(tmpdir(), "longview-dart-strict-cache-"));
+  const harness = createNoDataCashFlowHarness();
+  const config = { dartApiKey: "x".repeat(40) };
+  const cacheFile = path.join(temporary, "cashflows-2025-11011.json");
+  const corruptions = [
+    { completed: "true", record: null },
+    { completed: true, record: 0 },
+    { completed: true, record: false },
+    { completed: true, record: "" }
+  ];
+  try {
+    await syncDartMarket(
+      config,
+      noDataCashFlowOptions(harness, temporary, { runId: "strict-first" })
+    );
+    assert.equal(harness.getCashFlowCalls(), 1);
+
+    for (const [index, corruption] of corruptions.entries()) {
+      const cache = JSON.parse(await readFile(cacheFile, "utf8"));
+      cache.completedCorpCodes["00000001"] = corruption.completed;
+      cache.recordsByCorpCode["00000001"] = corruption.record;
+      await writeFile(cacheFile, JSON.stringify(cache), "utf8");
+      await syncDartMarket(
+        config,
+        noDataCashFlowOptions(harness, temporary, {
+          runId: `strict-corruption-${index}`
+        })
+      );
+      assert.equal(harness.getCashFlowCalls(), index + 2);
+      const repaired = JSON.parse(await readFile(cacheFile, "utf8"));
+      assert.equal(repaired.completedCorpCodes["00000001"], true);
+      assert.equal(repaired.recordsByCorpCode["00000001"], null);
+    }
+  } finally {
+    await rm(temporary, { recursive: true, force: true });
+  }
+});
+
+test("DART 빈 목록은 음성 캐시하고 해석 불가 행은 UNPARSED로 재시도한다", async () => {
+  const temporary = await mkdtemp(path.join(tmpdir(), "longview-dart-unparsed-"));
+  const harness = createNoDataCashFlowHarness();
+  const config = { dartApiKey: "x".repeat(40) };
+  const cacheFile = path.join(temporary, "cashflows-2025-11011.json");
+  try {
+    harness.setCashFlowPayload({ status: "000", list: [] });
+    await syncDartMarket(
+      config,
+      noDataCashFlowOptions(harness, temporary, { runId: "empty-first" })
+    );
+    await syncDartMarket(
+      config,
+      noDataCashFlowOptions(harness, temporary, { runId: "empty-second" })
+    );
+    assert.equal(harness.getCashFlowCalls(), 1);
+    let cache = JSON.parse(await readFile(cacheFile, "utf8"));
+    assert.equal(
+      cache.resultMetadataByCorpCode["00000001"].outcome,
+      "NO_DATA"
+    );
+
+    harness.filingIds["00000001"] = "20260302000002";
+    harness.setCashFlowPayload({
+      status: "000",
+      list: [
+        {
+          corp_code: "00000001",
+          fs_div: "CFS",
+          sj_div: "CF",
+          account_id: "custom_UnsupportedCashFlow",
+          account_nm: "현재 파서가 모르는 현금흐름",
+          thstrm_amount: "123",
+          reprt_code: "11011",
+          bsns_year: "2025",
+          currency: "KRW",
+          rcept_no: "20260302000002"
+        }
+      ]
+    });
+    await syncDartMarket(
+      config,
+      noDataCashFlowOptions(harness, temporary, { runId: "unparsed-first" })
+    );
+    assert.equal(harness.getCashFlowCalls(), 2);
+    cache = JSON.parse(await readFile(cacheFile, "utf8"));
+    assert.equal(
+      cache.resultMetadataByCorpCode["00000001"].outcome,
+      "UNPARSED"
+    );
+    assert.equal(cache.completedCorpCodes["00000001"], undefined);
+    assert.equal(cache.incompleteCorpCount, 1);
+    assert.equal(cache.completedAt, undefined);
+    assert.match(cache.errorsByCorpCode["00000001"], /파서로 해석하지 못했습니다/);
+
+    await syncDartMarket(
+      config,
+      noDataCashFlowOptions(harness, temporary, { runId: "unparsed-second" })
+    );
+    assert.equal(harness.getCashFlowCalls(), 3);
+  } finally {
+    await rm(temporary, { recursive: true, force: true });
+  }
+});
+
+test("DART 음성 캐시는 현재와 캐시 공시 ID가 모두 있을 때만 재사용한다", async () => {
+  const temporary = await mkdtemp(path.join(tmpdir(), "longview-dart-no-filing-"));
+  const harness = createNoDataCashFlowHarness();
+  const config = { dartApiKey: "x".repeat(40) };
+  harness.filingIds["00000001"] = "";
+  try {
+    await syncDartMarket(
+      config,
+      noDataCashFlowOptions(harness, temporary, { runId: "no-filing-first" })
+    );
+    await syncDartMarket(
+      config,
+      noDataCashFlowOptions(harness, temporary, { runId: "no-filing-second" })
+    );
+    assert.equal(harness.getCashFlowCalls(), 2);
+    const cache = JSON.parse(
+      await readFile(
+        path.join(temporary, "cashflows-2025-11011.json"),
+        "utf8"
+      )
+    );
+    assert.equal(
+      cache.resultMetadataByCorpCode["00000001"].outcome,
+      "NO_DATA"
+    );
+    assert.equal(
+      cache.resultMetadataByCorpCode["00000001"].sourceFilingId,
+      null
+    );
+
+    harness.filingIds["00000001"] = "20260301000001";
+    await syncDartMarket(
+      config,
+      noDataCashFlowOptions(harness, temporary, {
+        runId: "cached-filing-seed"
+      })
+    );
+    assert.equal(harness.getCashFlowCalls(), 3);
+    const cacheFile = path.join(temporary, "cashflows-2025-11011.json");
+    const missingCachedFiling = JSON.parse(await readFile(cacheFile, "utf8"));
+    missingCachedFiling.resultMetadataByCorpCode[
+      "00000001"
+    ].sourceFilingId = null;
+    missingCachedFiling.sourceFilingIdsByCorpCode["00000001"] = null;
+    await writeFile(
+      cacheFile,
+      JSON.stringify(missingCachedFiling),
+      "utf8"
+    );
+    await syncDartMarket(
+      config,
+      noDataCashFlowOptions(harness, temporary, {
+        runId: "cached-filing-missing"
+      })
+    );
+    assert.equal(harness.getCashFlowCalls(), 4);
+  } finally {
+    await rm(temporary, { recursive: true, force: true });
+  }
+});
+
+test("DART 현금흐름 제한시간은 체크포인트를 저장하고 전체 결과 생성을 계속한다", async () => {
+  const temporary = await mkdtemp(path.join(tmpdir(), "longview-dart-deadline-"));
+  const harness = createNoDataCashFlowHarness(2);
+  const config = { dartApiKey: "x".repeat(40) };
+  try {
+    const ticks = [0, 0, 50];
+    let tickIndex = 0;
+    const first = await syncDartMarket(
+      config,
+      noDataCashFlowOptions(harness, temporary, {
+        runId: "deadline-first",
+        cashFlowMaxDurationMs: 50,
+        cashFlowElapsedTimeMs: () =>
+          ticks[Math.min(tickIndex++, ticks.length - 1)]
+      })
+    );
+    assert.equal(first.companies.length, 2);
+    assert.equal(first.meta.cashFlowDeadlineReached, true);
+    assert.equal(harness.getCashFlowCalls(), 1);
+
+    const cacheFile = path.join(temporary, "cashflows-2025-11011.json");
+    const checkpoint = JSON.parse(await readFile(cacheFile, "utf8"));
+    assert.equal(checkpoint.deadlineReached, true);
+    assert.equal(Object.keys(checkpoint.completedCorpCodes).length, 1);
+    assert.equal(Object.keys(checkpoint.resultMetadataByCorpCode).length, 1);
+    assert.equal(
+      JSON.parse(await readFile(path.join(temporary, "companies.json"), "utf8"))
+        .companies.length,
+      2
+    );
+
+    const resumed = await syncDartMarket(
+      config,
+      noDataCashFlowOptions(harness, temporary, {
+        runId: "deadline-resumed",
+        cashFlowMaxDurationMs: 50,
+        cashFlowElapsedTimeMs: () => 0
+      })
+    );
+    assert.equal(resumed.companies.length, 2);
+    assert.equal(resumed.meta.cashFlowDeadlineReached, false);
+    assert.equal(harness.getCashFlowCalls(), 2);
+    const completed = JSON.parse(await readFile(cacheFile, "utf8"));
+    assert.equal(completed.deadlineReached, false);
+    assert.equal(Object.keys(completed.completedCorpCodes).length, 2);
   } finally {
     await rm(temporary, { recursive: true, force: true });
   }

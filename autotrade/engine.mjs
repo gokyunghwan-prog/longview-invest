@@ -76,7 +76,7 @@ function normalizedTimeBounds(value, fallback) {
   return { earliest, latest };
 }
 
-function liveOrderWindowBoundsAreOpen(bounds) {
+export function liveOrderWindowBoundsAreOpen(bounds) {
   const earliest = kstTradingClock(bounds.earliest);
   const latest = kstTradingClock(bounds.latest);
   return (
@@ -130,7 +130,8 @@ function securityMetadata(source = {}) {
     ticker: source.ticker,
     country: source.country,
     exchange: source.exchange,
-    name: source.name
+    name: source.name,
+    sector: source.sector
   };
 }
 
@@ -466,6 +467,25 @@ function managedAccount(account, state, config, now) {
   };
 }
 
+function enrichAccountPositionSectors(account, companies) {
+  const sectors = new Map();
+  for (const company of companies || []) {
+    const sector = String(company?.sector || "").trim();
+    if (!sector) continue;
+    sectors.set(portfolioSecurityKey(company), sector);
+  }
+  return {
+    ...account,
+    positions: (Array.isArray(account?.positions) ? account.positions : []).map(
+      (position) => {
+        if (String(position?.sector || "").trim()) return position;
+        const sector = sectors.get(portfolioSecurityKey(position));
+        return sector ? { ...position, sector } : position;
+      }
+    )
+  };
+}
+
 export class TradingEngine {
   constructor(
     config,
@@ -521,7 +541,8 @@ export class TradingEngine {
     force = false,
     liveConfirmation = false,
     cycleScope = "",
-    cashDeploymentOnly = false
+    cashDeploymentOnly = false,
+    scheduledRetry = false
   } = {}) {
     if (typeof this.stateStore.reload === "function") await this.stateStore.reload();
     const now = this.now();
@@ -530,8 +551,41 @@ export class TradingEngine {
     if (cashDeploymentOnly && !resolvedCycleScope) {
       throw new Error("추가입금 실행에는 일회성 실행 식별자가 필요합니다.");
     }
-    if (resolvedCycleScope && !cashDeploymentOnly) {
-      throw new Error("수동 실행 식별자는 추가입금 매수전용 실행에서만 사용할 수 있습니다.");
+    if (scheduledRetry && !resolvedCycleScope) {
+      throw new Error("예약 재시도에는 일일 실행 식별자가 필요합니다.");
+    }
+    if (scheduledRetry && cashDeploymentOnly) {
+      throw new Error("예약 재시도는 추가입금 매수전용 실행과 함께 사용할 수 없습니다.");
+    }
+    if (resolvedCycleScope && !cashDeploymentOnly && !scheduledRetry) {
+      throw new Error(
+        "실행 식별자는 추가입금 매수전용 또는 명시적인 예약 재시도에서만 사용할 수 있습니다."
+      );
+    }
+    const scopedCycleKey = resolvedCycleScope
+      ? buildCycleKey({
+          accountId: accountIdentity(this.config),
+          scope: resolvedCycleScope
+        })
+      : "";
+    if (
+      scopedCycleKey &&
+      new Set(state.strategy.completedCycleKeys || []).has(scopedCycleKey)
+    ) {
+      return {
+        ok: true,
+        alreadyCompleted: true,
+        signal: null,
+        account: null,
+        portfolio: null,
+        planner: null,
+        orders: [],
+        risk: null,
+        management: null,
+        blockedReasons: [],
+        cycleKey: scopedCycleKey,
+        plannedAt: now.toISOString()
+      };
     }
     const blockedReasons = [];
     if (await fileExists(this.killSwitchFile)) blockedReasons.push("긴급 정지 스위치가 켜져 있습니다.");
@@ -576,8 +630,12 @@ export class TradingEngine {
       liveKisOrder ? kstTradingClock(now).businessDate : null
     );
 
-    const rawAccount = await this.broker.getAccount(
+    const brokerAccount = await this.broker.getAccount(
       priceMap(signal.companies, executionQuotes.quotes)
+    );
+    const rawAccount = enrichAccountPositionSectors(
+      brokerAccount,
+      signal.companies
     );
     const managed = managedAccount(rawAccount, state, this.config, now);
     const account = managed.account;
@@ -647,37 +705,77 @@ export class TradingEngine {
       blockedReasons.push(planned.diagnostics?.reason || "주문계획을 만들 수 없습니다.");
     }
     let orders = prepareOrders(planned.orders || [], this.config);
-    const cycleKey = buildCycleKey({
-      signalRevision: signal.revision,
-      modelVersion: signal.modelVersion,
-      strategyVersion: this.config.strategy.version,
-      period: rebalancePeriodKst(now, this.config.strategy.rebalanceFrequency),
-      accountId: accountIdentity(this.config),
-      scope: resolvedCycleScope
-    });
     const existingCycleKeys = new Set(state.strategy.completedCycleKeys || []);
+    const sameDailyRevision =
+      !force &&
+      this.config.strategy.rebalanceFrequency === "daily" &&
+      Boolean(state.strategy.lastSnapshotRevision) &&
+      state.strategy.lastSnapshotRevision === signal.revision;
+    const cycleKey =
+      scopedCycleKey ||
+      buildCycleKey({
+        signalRevision: signal.revision,
+        modelVersion: signal.modelVersion,
+        strategyVersion: this.config.strategy.version,
+        period: rebalancePeriodKst(now, this.config.strategy.rebalanceFrequency),
+        accountId: accountIdentity(this.config)
+      });
     orders = orders.map((order, index) => ({
       ...order,
       checkpointId: orderCheckpointId(cycleKey, index, order)
     }));
     const staleDailySignal =
-      !force &&
-      this.config.strategy.rebalanceFrequency === "daily" &&
-      Boolean(state.strategy.lastSnapshotRevision) &&
-      state.strategy.lastSnapshotRevision === signal.revision &&
+      sameDailyRevision &&
       !existingCycleKeys.has(cycleKey);
     if (staleDailySignal) {
       blockedReasons.push("새로 게시된 일일 데이터가 없어 이전 신호를 다시 처리하지 않습니다.");
     }
+    const fallbackTurnoverWeight =
+      cashDeploymentTurnoverWeight ??
+      (planned.diagnostics?.deploymentPhase === "initial"
+        ? this.config.risk.initialDeploymentTurnoverWeight
+        : this.config.risk.maximumTurnoverWeight);
+    const plannedBuyTurnoverCapWeight = finite(
+      planned.diagnostics?.buyTurnoverCapWeight
+    );
+    const plannedSellTurnoverCapWeight = finite(
+      planned.diagnostics?.sellTurnoverCapWeight
+    );
+    const plannedGrossTurnoverCapWeight = finite(
+      planned.diagnostics?.grossTurnoverCapWeight
+    );
+    const buyTurnoverRiskCapWeight =
+      plannedBuyTurnoverCapWeight === null
+        ? null
+        : plannedBuyTurnoverCapWeight *
+          (1 + this.config.risk.limitPriceBuffer);
+    const sellTurnoverRiskCapWeight = plannedSellTurnoverCapWeight;
+    const grossTurnoverRiskCapWeight =
+      plannedGrossTurnoverCapWeight === null
+        ? null
+        : plannedGrossTurnoverCapWeight +
+          (plannedBuyTurnoverCapWeight || 0) *
+            this.config.risk.limitPriceBuffer;
+    const hasSideTurnoverCaps =
+      buyTurnoverRiskCapWeight !== null &&
+      sellTurnoverRiskCapWeight !== null;
     const orderRiskConfig = {
       ...this.config,
       risk: {
         ...this.config.risk,
         maximumTurnoverWeight:
-          cashDeploymentTurnoverWeight ??
-          (planned.diagnostics?.deploymentPhase === "initial"
-            ? this.config.risk.initialDeploymentTurnoverWeight
-            : this.config.risk.maximumTurnoverWeight)
+          hasSideTurnoverCaps
+            ? buyTurnoverRiskCapWeight + sellTurnoverRiskCapWeight
+            : fallbackTurnoverWeight,
+        ...(buyTurnoverRiskCapWeight !== null
+          ? { maximumBuyTurnoverWeight: buyTurnoverRiskCapWeight }
+          : {}),
+        ...(sellTurnoverRiskCapWeight !== null
+          ? { maximumSellTurnoverWeight: sellTurnoverRiskCapWeight }
+          : {}),
+        ...(grossTurnoverRiskCapWeight !== null
+          ? { maximumGrossTurnoverWeight: grossTurnoverRiskCapWeight }
+          : {})
       }
     };
     const orderRisk = assessOrders(orders, account, orderRiskConfig, {
@@ -821,6 +919,40 @@ export class TradingEngine {
     );
   }
 
+  async clearUnsentInFlight(plan, results, trigger) {
+    const summary = {
+      at: this.now().toISOString(),
+      trigger,
+      cycleKey: plan.cycleKey,
+      signalRevision: plan.signal?.revision || null,
+      candidateCount: plan.signal?.candidateCount ?? null,
+      selectedCount: plan.portfolio?.selected?.length || 0,
+      orderCount: plan.orders?.length || 0,
+      executed: false,
+      resultStatuses: results.map((item) => item.status),
+      blockedReasons: plan.blockedReasons || []
+    };
+    await this.stateStore.update(
+      (state) => {
+        const current = state.strategy.inFlight;
+        if (!current || current.cycleKey !== plan.cycleKey) {
+          const error = new Error("전송되지 않은 주문의 미결 상태가 변경되었습니다.");
+          error.code = "TRADING_IN_FLIGHT_CHANGED";
+          throw error;
+        }
+        state.strategy.inFlight = null;
+        state.runs.push(summary);
+        state.runs = state.runs.slice(-200);
+      },
+      {
+        type: "trading_run_no_external_order",
+        cycleKey: plan.cycleKey,
+        trigger,
+        orderCount: plan.orders.length
+      }
+    );
+  }
+
   async execute(options = {}) {
     const { trigger = "manual" } = options;
     const run = async () => {
@@ -841,7 +973,8 @@ export class TradingEngine {
     liveConfirmation = false,
     trigger = "manual",
     cycleScope = "",
-    cashDeploymentOnly = false
+    cashDeploymentOnly = false,
+    scheduledRetry = false
   } = {}) {
     let plan;
     try {
@@ -849,7 +982,8 @@ export class TradingEngine {
         force,
         liveConfirmation,
         cycleScope,
-        cashDeploymentOnly
+        cashDeploymentOnly,
+        scheduledRetry
       });
     } catch (error) {
       const safeError = redactSensitive(error, [
@@ -859,6 +993,15 @@ export class TradingEngine {
       ]);
       await this.stateStore.appendAudit({ type: "run_failed_before_order", trigger, error: safeError });
       throw new Error(safeError);
+    }
+
+    if (plan.alreadyCompleted === true) {
+      return {
+        ...plan,
+        executed: false,
+        results: [],
+        reason: "already_completed"
+      };
     }
 
     if (!plan.ok || plan.orders.length === 0) {
@@ -916,12 +1059,25 @@ export class TradingEngine {
       // order history before explicitly resolving it; automatic retries are unsafe.
       throw new Error(safeError);
     }
+    const noExternalOrderAttempt =
+      results.length > 0 &&
+      results.length === plan.orders.length &&
+      results.every(
+        (item, index) =>
+          String(item?.status || "").toLowerCase() === "blocked" &&
+          item?.notSent === true &&
+          item?.checkpointId === plan.orders[index]?.checkpointId
+      );
     const result = {
       ...plan,
-      executed: true,
+      executed: !noExternalOrderAttempt,
       results,
-      reason: null
+      reason: noExternalOrderAttempt ? "orders_not_sent" : null
     };
+    if (noExternalOrderAttempt) {
+      await this.clearUnsentInFlight(plan, results, trigger);
+      return result;
+    }
     // Any submitted/unknown order makes an immediate rerun unsafe. Mark the
     // cycle processed and reconcile with the broker before a future retry.
     await this.recordRun(result, { trigger, completed: true });
@@ -1352,18 +1508,23 @@ export class TradingEngine {
           ...submittedPending
         };
         for (const key of Object.keys(confirmedPending)) delete pendingManaged[key];
-        const executionOutcomeIsResolved = (result.results || []).every(
-          (item) =>
-            item.status === "filled" ||
-            item.status === "rejected" ||
-            item.status === "canceled" ||
-            item.status === "partial_canceled" ||
-            (item.status === "blocked" && item.notSent === true)
-        );
+        const executionOutcomeIsResolved =
+          (result.results || []).length === (result.orders || []).length &&
+          (result.results || []).every(
+            (item) =>
+              item.status === "filled" ||
+              item.status === "rejected" ||
+              item.status === "canceled" ||
+              item.status === "partial_canceled" ||
+              (item.status === "blocked" && item.notSent === true)
+          );
         state.strategy = {
           ...state.strategy,
           ...nextStrategy,
-          lastSnapshotRevision: result.signal?.revision || state.strategy.lastSnapshotRevision,
+          lastSnapshotRevision:
+            completed && result.signal?.revision
+              ? result.signal.revision
+              : state.strategy.lastSnapshotRevision,
           candidateCount: signalBaselineAccepted
             ? result.signal?.candidateCount ?? state.strategy.candidateCount
             : state.strategy.candidateCount,

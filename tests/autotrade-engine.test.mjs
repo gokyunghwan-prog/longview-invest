@@ -113,6 +113,39 @@ test("별도 엔진은 신호·분산전략·월간 계획·위험한도를 연�
   assert.ok(plan.orders.every((order) => order.orderType === "limit"));
 });
 
+test("계획기 회전한도 경계의 매수는 지정가 버퍼를 복원해도 side-risk에 오인 차단되지 않는다", async (t) => {
+  const { engine, stateStore, config } = await setup(t, {
+    TRADING_MAX_TURNOVER_PERCENT: "20",
+    TRADING_LIMIT_BUFFER_PERCENT: "5",
+    TRADING_AUTODEPLOY_CASH: "false"
+  });
+  await stateStore.update((state) => {
+    state.strategy.initialDeploymentCompleted = true;
+  });
+
+  const plan = await engine.plan();
+
+  const rawBuyCap =
+    plan.account.totalEquityKrw *
+    plan.planner.diagnostics.buyTurnoverCapWeight;
+  const bufferedBuyCap =
+    rawBuyCap * (1 + config.risk.limitPriceBuffer);
+  const configuredSharedGrossCap =
+    plan.account.totalEquityKrw * config.risk.maximumTurnoverWeight;
+  assert.equal(plan.planner.diagnostics.deploymentPhase, "routine");
+  assert.equal(plan.risk.orders.ok, true);
+  assert.ok(plan.risk.orders.grossBuyNotionalKrw > rawBuyCap + 1);
+  assert.ok(plan.risk.orders.grossBuyNotionalKrw <= bufferedBuyCap + 1);
+  assert.ok(
+    plan.risk.orders.grossNotionalKrw <= configuredSharedGrossCap + 1
+  );
+  assert.ok(Math.abs(bufferedBuyCap - configuredSharedGrossCap) <= 1);
+  assert.equal(
+    plan.blockedReasons.some((reason) => reason.includes("매수 회전율")),
+    false
+  );
+});
+
 test("모의 실행은 체결·관리종목·실행키를 기록하고 같은 주기 중복을 막는다", async (t) => {
   const { engine, stateStore } = await setup(t);
   const first = await engine.execute();
@@ -120,6 +153,7 @@ test("모의 실행은 체결·관리종목·실행키를 기록하고 같은 �
   assert.ok(first.results.every((result) => result.status === "filled"));
   const state = stateStore.snapshot();
   assert.ok(state.strategy.completedCycleKeys.includes(first.cycleKey));
+  assert.equal(state.strategy.lastSnapshotRevision, first.signal.revision);
   assert.equal(state.strategy.candidateCountScope, first.signal.candidateCountScope);
   const filledBuyKeys = new Set(
     first.results
@@ -128,6 +162,11 @@ test("모의 실행은 체결·관리종목·실행키를 기록하고 같은 �
   );
   assert.ok(filledBuyKeys.size > 0);
   assert.equal(Object.keys(state.strategy.managedSecurities).length, filledBuyKeys.size);
+  assert.ok(
+    Object.values(state.strategy.managedSecurities).every(
+      (managed) => typeof managed.sector === "string" && managed.sector.length > 0
+    )
+  );
   assert.ok(Object.keys(state.paper.positions).length > 0);
 
   const second = await engine.execute();
@@ -158,7 +197,66 @@ test("일회성 추가입금 사이클은 매수만 실행하고 같은 식별�
   client.getSignal = async () => structuredClone(refreshedSignal);
   const duplicate = await engine.execute(options);
   assert.equal(duplicate.executed, false);
-  assert.ok(duplicate.blockedReasons.some((reason) => reason.includes("이미 처리")));
+  assert.equal(duplicate.alreadyCompleted, true);
+  assert.equal(duplicate.reason, "already_completed");
+  assert.deepEqual(duplicate.blockedReasons, []);
+});
+
+test("현금 자동배치가 활성이어도 동일 revision이면 당일 fresh 검증이 없어 차단한다", async (t) => {
+  const { config, stateStore, broker, client, engine } = await setup(t, {
+    TRADING_REBALANCE_FREQUENCY: "daily",
+    TRADING_AUTODEPLOY_CASH: "true"
+  });
+  const first = await engine.execute();
+  assert.equal(first.executed, true);
+  await stateStore.update((state) => {
+    state.paper.cashKrw += 5_000_000;
+    state.strategy.initialDeploymentCompleted = true;
+  });
+  const nextEngine = await createTradingEngine(config, {
+    stateStore,
+    broker,
+    client,
+    now: () => new Date("2026-07-21T01:00:00.000Z")
+  });
+
+  const plan = await nextEngine.plan({
+    liveConfirmation: true,
+    scheduledRetry: true,
+    cycleScope: "scheduled-trade:2026-07-21"
+  });
+
+  assert.equal(plan.ok, false);
+  assert.equal(plan.planner.diagnostics.cashDeploymentActive, true);
+  assert.ok(plan.blockedReasons.some((reason) => reason.includes("새로 게시")));
+});
+
+test("동일 revision이어도 현금 자동배치가 비활성이면 기존 stale 차단을 유지한다", async (t) => {
+  const { config, stateStore, broker, client, engine } = await setup(t, {
+    TRADING_REBALANCE_FREQUENCY: "daily",
+    TRADING_AUTODEPLOY_CASH: "false"
+  });
+  const first = await engine.execute();
+  assert.equal(first.executed, true);
+  await stateStore.update((state) => {
+    state.paper.cashKrw += 5_000_000;
+  });
+  const nextEngine = await createTradingEngine(config, {
+    stateStore,
+    broker,
+    client,
+    now: () => new Date("2026-07-21T01:00:00.000Z")
+  });
+
+  const plan = await nextEngine.plan({
+    liveConfirmation: true,
+    scheduledRetry: true,
+    cycleScope: "scheduled-trade:2026-07-21"
+  });
+
+  assert.equal(plan.ok, false);
+  assert.equal(plan.planner.diagnostics.cashDeploymentActive, false);
+  assert.ok(plan.blockedReasons.some((reason) => reason.includes("새로 게시")));
 });
 
 test("게시 후보 급감은 관리종목 보강이나 반복 실행으로 기준선을 오염시키지 않는다", async (t) => {
@@ -343,6 +441,114 @@ test("상태 폴더 실행 잠금은 서로 다른 엔진의 동시 주문을 �
   await first;
   assert.equal(submissions, 1);
   assert.equal(stateStore.snapshot().strategy.inFlight, null);
+});
+
+test("예약 계획이 주문 전에 차단되면 revision을 소비하지 않고 같은 scope를 다시 계획한다", async (t) => {
+  const { engine, stateStore, client } = await setup(t, {
+    TRADING_REBALANCE_FREQUENCY: "daily"
+  });
+  const originalGetSignal = client.getSignal;
+  const originalGetAccount = engine.broker.getAccount.bind(engine.broker);
+  let signalCalls = 0;
+  let accountCalls = 0;
+  client.getSignal = async () => {
+    signalCalls += 1;
+    return originalGetSignal();
+  };
+  engine.broker.getAccount = async (...args) => {
+    accountCalls += 1;
+    return originalGetAccount(...args);
+  };
+  const options = {
+    scheduledRetry: true,
+    cycleScope: "scheduled-trade:2026-07-20"
+  };
+  await writeFile(engine.killSwitchFile, "stop\n", "utf8");
+
+  const first = await engine.execute(options);
+  const afterFirst = stateStore.snapshot();
+
+  assert.equal(first.ok, false);
+  assert.equal(first.executed, false);
+  assert.equal(first.reason, "blocked");
+  assert.equal(afterFirst.strategy.lastSnapshotRevision, null);
+  assert.equal(afterFirst.strategy.lastPlanAt, null);
+  assert.equal(afterFirst.strategy.completedCycleKeys.includes(first.cycleKey), false);
+
+  await rm(engine.killSwitchFile, { force: true });
+  const second = await engine.execute(options);
+
+  assert.equal(second.cycleKey, first.cycleKey);
+  assert.equal(second.executed, true);
+  assert.equal(signalCalls, 2);
+  assert.equal(accountCalls, 2);
+  assert.equal(
+    stateStore.snapshot().strategy.lastSnapshotRevision,
+    second.signal.revision
+  );
+  assert.ok(stateStore.snapshot().strategy.completedCycleKeys.includes(second.cycleKey));
+});
+
+test("전 주문이 외부 전송 전에 차단되면 완료 상태를 적용하지 않고 같은 scope를 재계획한다", async (t) => {
+  const { engine, stateStore, client } = await setup(t, {
+    TRADING_REBALANCE_FREQUENCY: "daily"
+  });
+  const originalGetSignal = client.getSignal;
+  let signalCalls = 0;
+  let accountCalls = 0;
+  let orderAttempts = 0;
+  client.getSignal = async () => {
+    signalCalls += 1;
+    return originalGetSignal();
+  };
+  engine.broker = {
+    name: "paper",
+    getAccount: async () => {
+      accountCalls += 1;
+      return {
+        broker: "paper",
+        cashKrw: 10_000_000,
+        positionsValueKrw: 0,
+        totalEquityKrw: 10_000_000,
+        positions: []
+      };
+    },
+    placeOrders: async (orders) => {
+      orderAttempts += 1;
+      return orders.map((order) => ({
+        ...order,
+        ...(orderAttempts === 1
+          ? { status: "blocked", notSent: true, errorCode: "TEST_NOT_SENT" }
+          : { status: "filled" })
+      }));
+    }
+  };
+  const options = {
+    scheduledRetry: true,
+    cycleScope: "scheduled-trade:2026-07-20"
+  };
+
+  const first = await engine.execute(options);
+  const afterFirst = stateStore.snapshot();
+
+  assert.equal(first.executed, false);
+  assert.equal(first.reason, "orders_not_sent");
+  assert.ok(first.results.every((item) => item.status === "blocked" && item.notSent));
+  assert.equal(afterFirst.strategy.inFlight, null);
+  assert.equal(afterFirst.strategy.lastSnapshotRevision, null);
+  assert.equal(afterFirst.strategy.lastPlanAt, null);
+  assert.deepEqual(afterFirst.strategy.removalStreaks, {});
+  assert.equal(afterFirst.strategy.completedCycleKeys.includes(first.cycleKey), false);
+
+  const second = await engine.execute(options);
+
+  assert.equal(second.cycleKey, first.cycleKey);
+  assert.equal(second.executed, true);
+  assert.ok(second.results.every((item) => item.status === "filled"));
+  assert.equal(signalCalls, 2);
+  assert.equal(accountCalls, 2);
+  assert.equal(orderAttempts, 2);
+  assert.ok(stateStore.snapshot().strategy.completedCycleKeys.includes(first.cycleKey));
 });
 
 test("주문 호출 뒤 오류가 나면 미결 상태를 남겨 재시도를 차단한다", async (t) => {
@@ -1032,12 +1238,16 @@ async function setupLiveKisEngine(
       targetWeight: 0.333333333333
     }))
   };
+  let signalCalls = 0;
+  let quoteCalls = 0;
+  let accountCalls = 0;
   let buyableCalls = 0;
   let submitted = 0;
   const broker = {
     name: "kis",
-    getQuotes: async (companies) =>
-      companies.map((item) => ({
+    getQuotes: async (companies) => {
+      quoteCalls += 1;
+      return companies.map((item) => ({
         id: item.id,
         ticker: item.ticker,
         country: "KR",
@@ -1047,17 +1257,21 @@ async function setupLiveKisEngine(
         current: true,
         asOf: quoteObservedAt,
         marketDate
-      })),
-    getAccount: async () => ({
-      broker: "kis",
-      cashKrw: accountCashKrw,
-      positionsValueKrw: accountPositions.reduce(
-        (sum, position) => sum + Number(position.marketValueKrw || 0),
-        0
-      ),
-      totalEquityKrw: accountTotalEquityKrw,
-      positions: structuredClone(accountPositions)
-    }),
+      }));
+    },
+    getAccount: async () => {
+      accountCalls += 1;
+      return {
+        broker: "kis",
+        cashKrw: accountCashKrw,
+        positionsValueKrw: accountPositions.reduce(
+          (sum, position) => sum + Number(position.marketValueKrw || 0),
+          0
+        ),
+        totalEquityKrw: accountTotalEquityKrw,
+        positions: structuredClone(accountPositions)
+      };
+    },
     getBuyableOrder: async () => {
       buyableCalls += 1;
       return { sufficient };
@@ -1096,7 +1310,12 @@ async function setupLiveKisEngine(
   const engine = await createTradingEngine(config, {
     stateStore,
     broker,
-    client: { getSignal: async () => structuredClone(sourceSignal) },
+    client: {
+      getSignal: async () => {
+        signalCalls += 1;
+        return structuredClone(sourceSignal);
+      }
+    },
     now: engineNow,
     timeBounds,
     beforePersist,
@@ -1104,12 +1323,81 @@ async function setupLiveKisEngine(
   });
   return {
     engine,
+    stateStore,
     counters: {
+      get signalCalls() { return signalCalls; },
+      get quoteCalls() { return quoteCalls; },
+      get accountCalls() { return accountCalls; },
       get buyableCalls() { return buyableCalls; },
       get submitted() { return submitted; }
     }
   };
 }
+
+test("예약 재시도 식별자는 명시적 옵션과 함께만 일반 거래에 사용할 수 있다", async (t) => {
+  const { engine } = await setup(t);
+  await assert.rejects(
+    engine.plan({ cycleScope: "scheduled-trade:2026-07-20" }),
+    /명시적인 예약 재시도/
+  );
+  await assert.rejects(
+    engine.plan({ scheduledRetry: true }),
+    /일일 실행 식별자/
+  );
+  await assert.rejects(
+    engine.plan({
+      scheduledRetry: true,
+      cashDeploymentOnly: true,
+      cycleScope: "scheduled-trade:2026-07-20"
+    }),
+    /함께 사용할 수 없습니다/
+  );
+});
+
+test("완료된 예약 일일 사이클은 신호·KIS 조회 전에 상태 변경 없이 멱등 성공한다", async (t) => {
+  const { engine, stateStore, counters } = await setupLiveKisEngine(t);
+  const options = {
+    liveConfirmation: true,
+    scheduledRetry: true,
+    cycleScope: "scheduled-trade:2026-07-20"
+  };
+  const initialPlan = await engine.plan(options);
+  assert.ok(initialPlan.cycleKey);
+  assert.equal(counters.signalCalls, 1);
+  assert.equal(counters.quoteCalls, 1);
+  assert.equal(counters.accountCalls, 1);
+
+  await stateStore.update((state) => {
+    state.strategy.completedCycleKeys = [initialPlan.cycleKey];
+    state.strategy.managedSecurities = {
+      "KR:999999": {
+        id: "KR-999999",
+        ticker: "999999",
+        country: "KR",
+        name: "보존 대상"
+      }
+    };
+  });
+  const before = stateStore.snapshot();
+  const beforeCalls = {
+    signal: counters.signalCalls,
+    quote: counters.quoteCalls,
+    account: counters.accountCalls
+  };
+
+  const duplicate = await engine.execute(options);
+
+  assert.equal(duplicate.ok, true);
+  assert.equal(duplicate.executed, false);
+  assert.equal(duplicate.alreadyCompleted, true);
+  assert.equal(duplicate.reason, "already_completed");
+  assert.deepEqual(duplicate.orders, []);
+  assert.deepEqual(duplicate.blockedReasons, []);
+  assert.equal(counters.signalCalls, beforeCalls.signal);
+  assert.equal(counters.quoteCalls, beforeCalls.quote);
+  assert.equal(counters.accountCalls, beforeCalls.account);
+  assert.deepEqual(stateStore.snapshot(), before);
+});
 
 test("createTradingEngine은 KIS 브로커에도 엔진과 같은 신뢰 시각을 주입한다", async (t) => {
   const rootDir = await mkdtemp(path.join(os.tmpdir(), "longview-kis-clock-"));
@@ -1155,6 +1443,44 @@ test("실전 전체자산 모드는 10만원 초과 현금도 관리 순자산�
   assert.equal(plan.account.totalEquityKrw, 135_000);
   assert.equal(plan.account.cashKrw, 135_000);
   assert.ok(plan.orders.length > 0);
+});
+
+test("KIS 포지션 sector 누락은 동일 신호 종목의 검증 sector로 보강해 거짓 한도 차단을 막는다", async (t) => {
+  const positions = [company(1), company(2), company(3)].map((item) => ({
+    id: item.id,
+    ticker: item.ticker,
+    name: item.name,
+    country: item.country,
+    exchange: item.exchange,
+    quantity: 2,
+    price: item.marketData.price,
+    marketValueKrw: item.marketData.price * 2
+  }));
+  const positionsValueKrw = positions.reduce(
+    (sum, position) => sum + position.marketValueKrw,
+    0
+  );
+  const { engine } = await setupLiveKisEngine(t, {
+    capitalLimitKrw: 100_000,
+    accountCashKrw: 100_000 - positionsValueKrw,
+    accountTotalEquityKrw: 100_000,
+    accountPositions: positions
+  });
+
+  const plan = await engine.plan({ liveConfirmation: true });
+
+  assert.equal(plan.ok, true);
+  assert.deepEqual(
+    plan.account.positions.map((position) => position.sector),
+    ["업종 1", "업종 2", "업종 3"]
+  );
+  assert.ok(plan.orders.some((order) => order.side === "buy"));
+  assert.equal(
+    plan.planner.diagnostics.skipped.some(
+      (item) => item.reason === "position_weight_limit"
+    ),
+    false
+  );
 });
 
 test("runner 시각이 장중이어도 신뢰 시각 범위가 장외이면 실전 계획을 차단한다", async (t) => {
@@ -1277,11 +1603,19 @@ test("KIS 당일 체결분이 예수금에도 남아 있어도 계좌 순자산�
 });
 
 test("실전 매수는 미수 없는 매수가능수량 확인을 통과해야만 전송된다", async (t) => {
-  const { engine, counters } = await setupLiveKisEngine(t, { sufficient: false });
+  const { engine, counters, stateStore } = await setupLiveKisEngine(t, {
+    sufficient: false
+  });
   const result = await engine.execute({ liveConfirmation: true });
-  assert.equal(result.executed, true);
+  assert.equal(result.executed, false);
+  assert.equal(result.reason, "orders_not_sent");
   assert.equal(counters.buyableCalls, 1);
   assert.equal(counters.submitted, 0);
+  assert.equal(stateStore.snapshot().strategy.inFlight, null);
+  assert.equal(
+    stateStore.snapshot().strategy.completedCycleKeys.includes(result.cycleKey),
+    false
+  );
   assert.ok(result.results.every((item) => item.status === "blocked"));
   assert.ok(
     result.results.every(

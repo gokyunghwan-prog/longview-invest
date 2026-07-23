@@ -33,6 +33,7 @@ test("자동매매는 기본적으로 비활성·로컬 모의 브로커다", ()
   assert.equal(result.strategy.minimumPositionKrw, 20_000);
   assert.equal(result.strategy.minimumOrderKrw, 5_000);
   assert.equal(result.longview.requirePublishedSelection, true);
+  assert.equal(result.risk.deployAvailableCash, false);
   assert.equal(result.risk.maximumTurnoverWeight, 0.1);
   assert.equal(result.risk.initialDeploymentTurnoverWeight, 1);
   assert.equal(result.strategy.minimumMarketCapKrw, 100_000_000_000);
@@ -138,6 +139,46 @@ test("실전에서 상한 0은 전용계좌 전체자산 별도 잠금이 모두
   assert.equal(
     "useAllDedicatedAccountAssetsAcknowledgement" in publicTradingConfig(enabled),
     false
+  );
+});
+
+test("실전 가용현금 자동투입은 현금 0%와 전용계좌 전체자산 잠금을 요구한다", () => {
+  const base = {
+    TRADING_MODE: "live",
+    TRADING_BROKER: "kis",
+    KIS_ENV: "prod",
+    KIS_APP_KEY: "app",
+    KIS_APP_SECRET: "secret",
+    KIS_ACCOUNT_NUMBER: "12345678",
+    TRADING_CAPITAL_LIMIT_KRW: "0",
+    TRADING_REQUIRE_DEDICATED_ACCOUNT: "true",
+    ENABLE_LIVE_TRADING: "true",
+    LIVE_TRADING_ACK: LIVE_ACKNOWLEDGEMENT,
+    TRADING_AUTODEPLOY_CASH: "true",
+    TRADING_USE_ALL_DEDICATED_ACCOUNT_ASSETS: "true",
+    USE_ALL_DEDICATED_ACCOUNT_ASSETS_ACK:
+      USE_ALL_DEDICATED_ACCOUNT_ASSETS_ACKNOWLEDGEMENT
+  };
+
+  const enabled = config(base);
+  assert.equal(enabled.risk.deployAvailableCash, true);
+
+  assert.throws(
+    () => config({ ...base, TRADING_CASH_RESERVE_PERCENT: "5" }),
+    /목표 현금 비중이 0%/
+  );
+  assert.throws(
+    () => config({ ...base, TRADING_CAPITAL_LIMIT_KRW: "1000000" }),
+    /전용계좌 전체자산 모드/
+  );
+  assert.throws(
+    () =>
+      config({
+        ...base,
+        TRADING_USE_ALL_DEDICATED_ACCOUNT_ASSETS: "false",
+        USE_ALL_DEDICATED_ACCOUNT_ASSETS_ACK: ""
+      }),
+    /전체자산 별도 잠금/
   );
 });
 

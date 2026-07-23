@@ -6,9 +6,11 @@ import test from "node:test";
 
 import {
   CLOUD_LIVE_ACKNOWLEDGEMENT,
+  CloudAutotradeOutcomeError,
   acquireCloudLease,
   assertCloudLeaseOwned,
   assertCloudLiveAuthorization,
+  publicCloudRunnerFailure,
   redactCloudRunnerError,
   runCloudAutotrade
 } from "../scripts/cloud-autotrade.mjs";
@@ -30,8 +32,10 @@ class FakeCloudStore {
     this.currentSha = state ? sha(1) : null;
     this.saveCount = 0;
     this.ensureCount = 0;
+    this.loadCount = 0;
     this.assertCount = 0;
     this.timeSampleCount = 0;
+    this.dateHeader = "Wed, 22 Jul 2026 10:23:45 GMT";
     this.savedStates = [];
     this.forceAssertConflict = false;
   }
@@ -42,6 +46,7 @@ class FakeCloudStore {
   }
 
   async load() {
+    this.loadCount += 1;
     return {
       exists: Boolean(this.state),
       state: this.state ? structuredClone(this.state) : null,
@@ -76,7 +81,7 @@ class FakeCloudStore {
     this.timeSampleCount += 1;
     return {
       status: 200,
-      dateHeader: "Wed, 22 Jul 2026 10:23:45 GMT",
+      dateHeader: this.dateHeader,
       redirected: false
     };
   }
@@ -235,6 +240,127 @@ test("시각을 주입하지 않은 클라우드 실행은 GitHub Date 신뢰 �
   assert.equal(typeof dependencies.beforePersist, "function");
   assert.equal(typeof dependencies.beforeOrder, "function");
   assert.equal(typeof dependencies.timeBounds, "function");
+});
+
+test("장외 auto heartbeat는 GitHub Date만 확인하고 원격 상태·엔진·KIS에 접근하지 않는다", async (t) => {
+  const stateDir = await temporaryDirectory(t);
+  const cloud = new FakeCloudStore();
+  const logs = [];
+  let engineCreated = false;
+
+  const summary = await runCloudAutotrade({
+    command: "auto",
+    env: actionEnv({
+      GITHUB_EVENT_NAME: "schedule",
+      CLOUD_EVENT_SCHEDULE: "17,47 * * * 1-5",
+      CLOUD_MANUAL_LIVE_CONFIRM: "false"
+    }),
+    config: liveConfig(stateDir),
+    cloudStore: cloud,
+    output: (value) => logs.push(value),
+    engineFactory: async () => {
+      engineCreated = true;
+      throw new Error("장외 auto에서 엔진을 만들면 안 됩니다.");
+    }
+  });
+
+  assert.equal(summary.ok, true);
+  assert.equal(summary.executed, false);
+  assert.equal(summary.skipped, true);
+  assert.equal(summary.skipCode, "OUTSIDE_ORDER_WINDOW");
+  assert.deepEqual(summary.blockedCodes, ["OUTSIDE_ORDER_WINDOW"]);
+  assert.equal(summary.blockedCount, 0);
+  assert.equal(engineCreated, false);
+  assert.equal(cloud.ensureCount, 0);
+  assert.equal(cloud.loadCount, 0);
+  assert.equal(cloud.saveCount, 0);
+  assert.ok(cloud.timeSampleCount > 0);
+  assert.equal(logs.length, 1);
+  assert.doesNotMatch(logs[0], /12345678|sensitive|state-key/i);
+});
+
+test("장중 auto heartbeat는 조정 후 KST 일자 고정 scope로 일반 거래를 재시도한다", async (t) => {
+  const stateDir = await temporaryDirectory(t);
+  const cloud = new FakeCloudStore();
+  cloud.dateHeader = "Tue, 21 Jul 2026 00:23:45 GMT";
+  const calls = [];
+  const logs = [];
+
+  const summary = await runCloudAutotrade({
+    command: "auto",
+    env: actionEnv({
+      GITHUB_EVENT_NAME: "schedule",
+      CLOUD_EVENT_SCHEDULE: "17,47 * * * 1-5",
+      CLOUD_MANUAL_LIVE_CONFIRM: "false"
+    }),
+    config: liveConfig(stateDir),
+    cloudStore: cloud,
+    output: (value) => logs.push(value),
+    engineFactory: async () => ({
+      async reconcileInFlight(options) {
+        calls.push(["reconcile", options]);
+        return { status: "none", pendingCount: 0, canceledCount: 0 };
+      },
+      async execute(options) {
+        calls.push(["execute", options]);
+        return {
+          ok: true,
+          executed: true,
+          orders: [
+            { side: "sell", ticker: "000001" },
+            { side: "buy", ticker: "000002" }
+          ],
+          results: [{ status: "submitted" }, { status: "filled" }],
+          blockedReasons: [],
+          planner: {
+            diagnostics: {
+              deploymentPhase: "routine",
+              cashDeploymentActive: true,
+              cashDeploymentResidualCode: "BELOW_MIN_ORDER",
+              skipped: [
+                { id: "secret-security-id", reason: "minimum_order" },
+                {
+                  id: "another-secret-id",
+                  reason: "replacement_waiting_for_removal_confirmation"
+                }
+              ]
+            }
+          }
+        };
+      }
+    })
+  });
+
+  assert.deepEqual(calls, [
+    ["reconcile", { trigger: "github-actions-pretrade", cancelOpenOrders: false }],
+    [
+      "execute",
+      {
+        trigger: "github-actions-scheduled-auto",
+        liveConfirmation: true,
+        scheduledRetry: true,
+        cycleScope: "scheduled-trade:2026-07-21"
+      }
+    ]
+  ]);
+  assert.equal(summary.ok, true);
+  assert.equal(summary.orderSubmissionAttempted, true);
+  assert.equal(summary.plannedBuyCount, 1);
+  assert.equal(summary.plannedSellCount, 1);
+  assert.equal(summary.deploymentPhase, "routine");
+  assert.equal(summary.cashDeploymentActive, true);
+  assert.equal(summary.idempotentDuplicate, false);
+  assert.deepEqual(summary.blockedCodes, []);
+  assert.deepEqual(summary.residualCodes, [
+    "BELOW_MIN_ORDER",
+    "REPLACEMENT_WAITING"
+  ]);
+  assert.equal(logs.length, 1);
+  assert.doesNotMatch(
+    logs[0],
+    /000001|000002|12345678|sensitive|secret-security-id|another-secret-id/i
+  );
+  assert.doesNotMatch(logs[0], /"minimum_order"|replacement_waiting/);
 });
 
 test("GitHub Date 조회 기능이 없으면 원격 상태나 엔진에 접근하기 전에 실패 폐쇄한다", async (t) => {
@@ -551,6 +677,87 @@ test("blocked trade emits a safe summary and fails the cloud run", async (t) => 
   assert.doesNotMatch(logs[0], /unsafe-secret-trade-reason|sensitive/i);
 });
 
+test("주문 결과가 제출·체결 외 상태이거나 불완전하면 비민감 코드로 job을 실패시킨다", async (t) => {
+  const cases = [
+    {
+      name: "not-sent",
+      orders: [{ side: "buy" }],
+      results: [{ status: "blocked", notSent: true }],
+      expected: ["ORDER_BLOCKED_NOT_SENT"]
+    },
+    {
+      name: "rejected",
+      orders: [{ side: "buy" }],
+      results: [{ status: "rejected" }],
+      expected: ["ORDER_REJECTED"]
+    },
+    {
+      name: "unknown",
+      orders: [{ side: "buy" }],
+      results: [{ status: "unknown" }],
+      expected: ["ORDER_UNKNOWN"]
+    },
+    {
+      name: "other",
+      orders: [{ side: "buy" }],
+      results: [{ status: "ticker=005930 price=71234 qty=9 cash=987654" }],
+      expected: ["UNEXPECTED_RESULT_STATUS"]
+    },
+    {
+      name: "mixed",
+      orders: [{ side: "buy" }, { side: "buy" }],
+      results: [
+        { status: "submitted" },
+        { status: "blocked", notSent: true }
+      ],
+      expected: ["ORDER_BLOCKED_NOT_SENT", "MIXED_RESULT"]
+    },
+    {
+      name: "incomplete",
+      orders: [{ side: "buy" }, { side: "buy" }],
+      results: [{ status: "submitted" }],
+      expected: ["INCOMPLETE_RESULT_SET"]
+    }
+  ];
+
+  for (const fixture of cases) {
+    await t.test(fixture.name, async (subtest) => {
+      const stateDir = await temporaryDirectory(subtest);
+      const cloud = new FakeCloudStore();
+      const logs = [];
+      await assert.rejects(
+        runCloudAutotrade({
+          command: "trade",
+          env: actionEnv(),
+          config: liveConfig(stateDir),
+          cloudStore: cloud,
+          now: () => new Date(FIXED_NOW),
+          output: (value) => logs.push(value),
+          engineFactory: async () => ({
+            reconcileInFlight: async () => ({ status: "none" }),
+            execute: async () => ({
+              ok: true,
+              executed: true,
+              orders: fixture.orders,
+              results: fixture.results,
+              blockedReasons: []
+            })
+          })
+        }),
+        (error) => error?.code === "CLOUD_AUTOTRADE_OUTCOME_UNSAFE"
+      );
+      assert.equal(logs.length, 1);
+      const summary = JSON.parse(logs[0]);
+      assert.equal(summary.ok, false);
+      assert.deepEqual(summary.resultBlockedCodes, fixture.expected);
+      assert.doesNotMatch(
+        logs[0],
+        /005930|71234|987654|ticker=|price=|qty=|cash=/i
+      );
+    });
+  }
+});
+
 test("pending pretrade reconciliation fails before execute", async (t) => {
   const stateDir = await temporaryDirectory(t);
   const cloud = new FakeCloudStore();
@@ -659,6 +866,16 @@ test("ambiguous reconciliation emits a safe summary and fails", async (t) => {
 test("예약 실행은 cron과 명령이 다르면 실전 실행을 거부한다", async (t) => {
   const stateDir = await temporaryDirectory(t);
   const config = liveConfig(stateDir);
+  assert.doesNotThrow(() =>
+    assertCloudLiveAuthorization(
+      "auto",
+      config,
+      actionEnv({
+        GITHUB_EVENT_NAME: "schedule",
+        CLOUD_EVENT_SCHEDULE: "17,47 * * * 1-5"
+      })
+    )
+  );
   assert.throws(
     () =>
       assertCloudLiveAuthorization(
@@ -667,6 +884,30 @@ test("예약 실행은 cron과 명령이 다르면 실전 실행을 거부한다
         actionEnv({
           GITHUB_EVENT_NAME: "schedule",
           CLOUD_EVENT_SCHEDULE: "13 6 * * 1-5"
+        })
+      ),
+    /예약 실행 시간/
+  );
+  assert.throws(
+    () =>
+      assertCloudLiveAuthorization(
+        "auto",
+        config,
+        actionEnv({
+          GITHUB_EVENT_NAME: "schedule",
+          CLOUD_EVENT_SCHEDULE: "23 0 * * 1-5"
+        })
+      ),
+    /예약 실행 시간/
+  );
+  assert.throws(
+    () =>
+      assertCloudLiveAuthorization(
+        "trade",
+        config,
+        actionEnv({
+          GITHUB_EVENT_NAME: "schedule",
+          CLOUD_EVENT_SCHEDULE: "23 0 * * 1-5"
         })
       ),
     /예약 실행 시간/
@@ -816,13 +1057,38 @@ test("오류 출력은 GitHub·암호화·KIS 비밀값을 모두 가린다", as
   assert.match(safe, /redacted/i);
 });
 
-test("GitHub workflow는 비활성 기본값·고정 SHA·두 단계 일정을 유지한다", async () => {
+test("공개 최상위 실패 출력은 원문 대신 allowlisted category만 반환한다", () => {
+  const error = new Error(
+    "KIS_PRODUCT_CODE=01 account=12345678 cash=987654 price=71234 qty=9 ticker=005930"
+  );
+  error.code = "SOME_UNEXPECTED_KIS_FAILURE";
+  const payload = JSON.stringify(publicCloudRunnerFailure(error));
+
+  assert.deepEqual(JSON.parse(payload), {
+    ok: false,
+    errorCode: "INTERNAL_ERROR"
+  });
+  assert.doesNotMatch(
+    payload,
+    /PRODUCT_CODE|01|12345678|987654|71234|qty|005930|KIS_FAILURE/i
+  );
+
+  const unsafe = new CloudAutotradeOutcomeError();
+  assert.deepEqual(publicCloudRunnerFailure(unsafe), {
+    ok: false,
+    errorCode: "UNSAFE_OUTCOME"
+  });
+});
+
+test("GitHub workflow는 비활성 기본값·고정 SHA·멱등 heartbeat와 조정 일정을 유지한다", async () => {
   const workflow = await readFile(
     new URL("../.github/workflows/live-autotrade.yml", import.meta.url),
     "utf8"
   );
-  assert.match(workflow, /cron: "23 0 \* \* 1-5"/);
+  assert.match(workflow, /cron: "17,47 \* \* \* 1-5"/);
   assert.match(workflow, /cron: "13 6 \* \* 1-5"/);
+  assert.match(workflow, /node scripts\/cloud-autotrade\.mjs auto/);
+  assert.match(workflow, /CLOUD_EVENT_SCHEDULE: "17,47 \* \* \* 1-5"/);
   assert.match(workflow, /vars\.AUTOTRADE_LIVE_ENABLED == 'true'/);
   assert.match(workflow, /github\.ref == 'refs\/heads\/main'/);
   assert.match(workflow, /cancel-in-progress: false/);
@@ -840,6 +1106,7 @@ test("GitHub workflow는 비활성 기본값·고정 SHA·두 단계 일정을 �
   assert.match(workflow, /TRADING_CASH_RESERVE_PERCENT: "0"/);
   assert.match(workflow, /TRADING_CAPITAL_LIMIT_KRW: "0"/);
   assert.match(workflow, /TRADING_USE_ALL_DEDICATED_ACCOUNT_ASSETS: "true"/);
+  assert.match(workflow, /TRADING_AUTODEPLOY_CASH: "true"/);
   assert.match(workflow, /tests\/autotrade-engine\.test\.mjs/);
   assert.match(workflow, /tests\/autotrade-planner\.test\.mjs/);
   assert.match(workflow, /tests\/autotrade-risk\.test\.mjs/);
