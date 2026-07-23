@@ -1,8 +1,8 @@
 {
   "schemaVersion": 1,
-  "generatedAt": "2026-07-23T12:12:30.348Z",
-  "sourceRevision": "5e4f1f7c03a423eedc06",
-  "sourceUpdatedAt": "2026-07-23T12:12:23.663Z",
+  "generatedAt": "2026-07-23T18:23:35.677Z",
+  "sourceRevision": "708b0a416f989a4a907c",
+  "sourceUpdatedAt": "2026-07-23T18:23:24.201Z",
   "modelVersion": "2.0.0",
   "strategyVersion": "longview-domestic-capital-aware-v2",
   "policy": {
@@ -31,7 +31,7 @@
   "status": "ready",
   "blockedReasons": [],
   "summary": {
-    "evaluated": 2652,
+    "evaluated": 2651,
     "strictEligible": 12,
     "referenceAffordable": 12,
     "selected": 3,
