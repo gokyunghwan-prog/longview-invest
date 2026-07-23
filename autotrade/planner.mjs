@@ -35,6 +35,10 @@ function normalizedConfig(config = {}) {
     rebalanceDrift: finite(strategy.rebalanceDrift) ?? 0.01,
     removalConfirmations: Math.max(1, Math.floor(finite(strategy.removalConfirmations) ?? 2)),
     minimumOrderKrw: positive(strategy.minimumOrderKrw) ?? 50_000,
+    maximumPositions: Math.max(
+      1,
+      Math.floor(finite(strategy.maximumPositions) ?? 5)
+    ),
     maximumPositionWeight: finite(strategy.maximumPositionWeight) ?? 0.15,
     maximumSectorWeight: finite(strategy.maximumSectorWeight) ?? 0.2,
     maximumTurnoverWeight: finite(risk.maximumTurnoverWeight) ?? 0.1,
@@ -43,7 +47,8 @@ function normalizedConfig(config = {}) {
     maximumOrdersPerRun: Math.max(1, Math.floor(finite(risk.maximumOrdersPerRun) ?? 20)),
     limitPriceBuffer: Math.max(0, finite(risk.limitPriceBuffer) ?? 0),
     estimatedFeeRate: Math.max(0, finite(paper.feeRate) ?? 0),
-    reuseProjectedSellProceeds: risk.reuseProjectedSellProceeds !== false
+    reuseProjectedSellProceeds: risk.reuseProjectedSellProceeds !== false,
+    deployAvailableCash: risk.deployAvailableCash === true
   };
 }
 
@@ -258,34 +263,89 @@ function applyTurnoverAndCashLimits(candidates, {
   cashKrw,
   reserveKrw,
   maximumTurnoverKrw,
+  maximumBuyTurnoverKrw = maximumTurnoverKrw,
+  maximumSellTurnoverKrw = maximumTurnoverKrw,
   maximumOrders,
   policy,
   sweepCandidates = [],
   positionValues = new Map(),
-  sectorValues = new Map()
+  sectorValues = new Map(),
+  positionKeys = new Set()
 }) {
   const orders = [];
   const skipped = [];
-  let remainingTurnover = maximumTurnoverKrw;
+  const residualBlockers = new Set();
+  let remainingGrossTurnover = maximumTurnoverKrw;
+  let remainingBuyTurnover = maximumBuyTurnoverKrw;
+  let remainingSellTurnover = maximumSellTurnoverKrw;
+  let buyTurnoverKrw = 0;
+  let sellTurnoverKrw = 0;
   let availableCash = Math.max(0, cashKrw - reserveKrw);
   let estimatedCashAfterKrw = cashKrw;
   const nextPositionValues = new Map(positionValues);
   const nextSectorValues = new Map(sectorValues);
+  const nextPositionKeys = new Set(positionKeys);
   const maximumPositionKrw = equity * policy.maximumPositionWeight;
   const maximumSectorKrw = equity * policy.maximumSectorWeight;
 
   for (const candidate of candidates) {
     if (orders.length >= maximumOrders) {
       skipped.push({ id: candidate.source.id, reason: "maximum_orders" });
+      residualBlockers.add("maximum_orders");
       continue;
     }
-    const turnoverQuantity = Math.floor(remainingTurnover / candidate.priceKrw);
+    const remainingSideTurnover =
+      candidate.side === "buy" ? remainingBuyTurnover : remainingSellTurnover;
+    const turnoverQuantity = Math.floor(
+      Math.min(remainingGrossTurnover, remainingSideTurnover) / candidate.priceKrw
+    );
     let quantity = Math.min(candidate.quantity, turnoverQuantity);
+    if (quantity <= 0) {
+      skipped.push({ id: candidate.source.id, reason: "turnover_or_cash_limit" });
+      residualBlockers.add("turnover_or_cash_limit");
+      continue;
+    }
     if (candidate.side === "buy") {
+      const key = portfolioSecurityKey(candidate.source);
+      const sector = String(candidate.source.sector || "미분류");
+      if (
+        !nextPositionKeys.has(key) &&
+        nextPositionKeys.size >= policy.maximumPositions
+      ) {
+        skipped.push({ id: candidate.source.id, reason: "maximum_positions" });
+        residualBlockers.add("maximum_positions");
+        continue;
+      }
+      const bufferedUnitPrice = bufferedCashPrice(
+        candidate.limitPrice,
+        "buy",
+        policy.limitPriceBuffer
+      );
+      const positionRoomKrw =
+        maximumPositionKrw - (nextPositionValues.get(key) || 0);
+      const sectorRoomKrw =
+        maximumSectorKrw - (nextSectorValues.get(sector) || 0);
+      const positionQuantity = Math.floor(
+        Math.max(0, positionRoomKrw) / bufferedUnitPrice
+      );
+      const sectorQuantity = Math.floor(
+        Math.max(0, sectorRoomKrw) / bufferedUnitPrice
+      );
+      if (positionQuantity <= 0 || sectorQuantity <= 0) {
+        skipped.push({ id: candidate.source.id, reason: "position_weight_limit" });
+        residualBlockers.add("position_weight_limit");
+        continue;
+      }
+      quantity = Math.min(quantity, positionQuantity, sectorQuantity);
       quantity = affordableBuyQuantity(candidate, quantity, availableCash, policy);
     }
     if (quantity <= 0) {
       skipped.push({ id: candidate.source.id, reason: "turnover_or_cash_limit" });
+      residualBlockers.add(
+        candidate.side === "buy" && availableCash < policy.minimumOrderKrw
+          ? "minimum_order"
+          : "turnover_or_cash_limit"
+      );
       continue;
     }
     let notionalKrw = quantity * candidate.priceKrw;
@@ -293,6 +353,7 @@ function applyTurnoverAndCashLimits(candidates, {
       candidate.reason === "confirmed_removal" && quantity === candidate.quantity;
     if (notionalKrw < policy.minimumOrderKrw && !isCompleteRemoval) {
       skipped.push({ id: candidate.source.id, reason: "minimum_order" });
+      residualBlockers.add("minimum_order");
       continue;
     }
 
@@ -305,7 +366,14 @@ function applyTurnoverAndCashLimits(candidates, {
       notionalKrw
     });
     orders.push(order);
-    remainingTurnover -= notionalKrw;
+    remainingGrossTurnover -= notionalKrw;
+    if (candidate.side === "sell") {
+      remainingSellTurnover -= notionalKrw;
+      sellTurnoverKrw += notionalKrw;
+    } else {
+      remainingBuyTurnover -= notionalKrw;
+      buyTurnoverKrw += notionalKrw;
+    }
     const cashAmount = estimatedCashAmount(candidate, quantity, candidate.side, policy);
     const key = portfolioSecurityKey(candidate.source);
     const sector = String(candidate.source.sector || "미분류");
@@ -313,13 +381,22 @@ function applyTurnoverAndCashLimits(candidates, {
       candidate.side === "buy"
         ? quantity * bufferedCashPrice(candidate.limitPrice, "buy", policy.limitPriceBuffer)
         : notionalKrw;
-    const valueChange = candidate.side === "sell" ? -notionalKrw : bufferedExposureKrw;
+    const valueChange =
+      candidate.side === "sell"
+        ? policy.reuseProjectedSellProceeds
+          ? -notionalKrw
+          : 0
+        : bufferedExposureKrw;
     nextPositionValues.set(key, Math.max(0, (nextPositionValues.get(key) || 0) + valueChange));
     nextSectorValues.set(sector, Math.max(0, (nextSectorValues.get(sector) || 0) + valueChange));
     if (candidate.side === "sell") {
-      if (policy.reuseProjectedSellProceeds) availableCash += cashAmount;
+      if (policy.reuseProjectedSellProceeds) {
+        availableCash += cashAmount;
+        if (isCompleteRemoval) nextPositionKeys.delete(key);
+      }
       estimatedCashAfterKrw += cashAmount;
     } else {
+      nextPositionKeys.add(key);
       availableCash -= cashAmount;
       estimatedCashAfterKrw -= cashAmount;
     }
@@ -347,7 +424,12 @@ function applyTurnoverAndCashLimits(candidates, {
       .map((order) => portfolioSecurityKey(order))
   );
   let swept = true;
-  while (swept && availableCash > 0 && remainingTurnover > 0) {
+  while (
+    swept &&
+    availableCash > 0 &&
+    remainingGrossTurnover > 0 &&
+    remainingBuyTurnover > 0
+  ) {
     swept = false;
     for (const candidate of sweepQueue) {
       const key = portfolioSecurityKey(candidate.source);
@@ -356,6 +438,14 @@ function applyTurnoverAndCashLimits(candidates, {
       const positionValue = nextPositionValues.get(key) || 0;
       const sectorValue = nextSectorValues.get(sector) || 0;
       const existingOrder = buyOrders.get(key);
+      if (
+        !existingOrder &&
+        !nextPositionKeys.has(key) &&
+        nextPositionKeys.size >= policy.maximumPositions
+      ) {
+        residualBlockers.add("maximum_positions");
+        continue;
+      }
       const minimumQuantity = existingOrder
         ? 1
         : Math.max(1, Math.ceil(policy.minimumOrderKrw / candidate.priceKrw));
@@ -364,12 +454,35 @@ function applyTurnoverAndCashLimits(candidates, {
         minimumQuantity *
         bufferedCashPrice(candidate.limitPrice, "buy", policy.limitPriceBuffer);
       if (positionValue >= candidate.targetValueKrw - 1) continue;
-      if (rawNotional > remainingTurnover + 1) continue;
-      if (positionValue + bufferedExposure > maximumPositionKrw + 1) continue;
-      if (sectorValue + bufferedExposure > maximumSectorKrw + 1) continue;
+      if (rawNotional > remainingGrossTurnover + 1) {
+        residualBlockers.add("turnover_or_cash_limit");
+        continue;
+      }
+      if (rawNotional > remainingBuyTurnover + 1) {
+        residualBlockers.add("turnover_or_cash_limit");
+        continue;
+      }
+      if (positionValue + bufferedExposure > maximumPositionKrw + 1) {
+        residualBlockers.add("position_weight_limit");
+        continue;
+      }
+      if (sectorValue + bufferedExposure > maximumSectorKrw + 1) {
+        residualBlockers.add("position_weight_limit");
+        continue;
+      }
       const cashCost = estimatedCashAmount(candidate, minimumQuantity, "buy", policy);
-      if (cashCost > availableCash + 1) continue;
-      if (!existingOrder && orders.length >= maximumOrders) continue;
+      if (cashCost > availableCash) {
+        residualBlockers.add(
+          availableCash < policy.minimumOrderKrw
+            ? "minimum_order"
+            : "turnover_or_cash_limit"
+        );
+        continue;
+      }
+      if (!existingOrder && orders.length >= maximumOrders) {
+        residualBlockers.add("maximum_orders");
+        continue;
+      }
 
       if (existingOrder) {
         existingOrder.quantity += minimumQuantity;
@@ -386,7 +499,10 @@ function applyTurnoverAndCashLimits(candidates, {
         orders.push(order);
         buyOrders.set(key, order);
       }
-      remainingTurnover -= rawNotional;
+      nextPositionKeys.add(key);
+      remainingGrossTurnover -= rawNotional;
+      remainingBuyTurnover -= rawNotional;
+      buyTurnoverKrw += rawNotional;
       availableCash -= cashCost;
       estimatedCashAfterKrw -= cashCost;
       nextPositionValues.set(key, positionValue + bufferedExposure);
@@ -398,10 +514,47 @@ function applyTurnoverAndCashLimits(candidates, {
   return {
     orders,
     skipped,
-    turnoverKrw: maximumTurnoverKrw - remainingTurnover,
-    turnoverWeight: equity ? (maximumTurnoverKrw - remainingTurnover) / equity : 0,
+    turnoverKrw: buyTurnoverKrw + sellTurnoverKrw,
+    turnoverWeight: equity ? (buyTurnoverKrw + sellTurnoverKrw) / equity : 0,
+    buyTurnoverKrw,
+    buyTurnoverWeight: equity ? buyTurnoverKrw / equity : 0,
+    sellTurnoverKrw,
+    sellTurnoverWeight: equity ? sellTurnoverKrw / equity : 0,
+    residualBlockers: [...residualBlockers],
+    resultingPositionCount: nextPositionKeys.size,
+    availableCashAfterKrw: Math.max(0, availableCash),
     estimatedCashAfterKrw: Math.max(0, estimatedCashAfterKrw)
   };
+}
+
+function automaticCashResidualCode({
+  active,
+  availableCashAfterKrw,
+  minimumOrderKrw,
+  skipped,
+  residualBlockers
+}) {
+  if (!active || availableCashAfterKrw <= 1) return null;
+  const reasons = new Set([
+    ...skipped.map((item) => item.reason),
+    ...residualBlockers
+  ]);
+  if (
+    reasons.has("replacement_waiting_for_removal_confirmation") ||
+    reasons.has("maximum_orders") ||
+    reasons.has("maximum_positions")
+  ) {
+    return "POSITION_LIMIT";
+  }
+  if (reasons.has("position_weight_limit")) return "POSITION_WEIGHT_LIMIT";
+  if (
+    reasons.has("minimum_order") ||
+    availableCashAfterKrw < minimumOrderKrw
+  ) {
+    return "BELOW_MIN_ORDER";
+  }
+  if (reasons.has("turnover_or_cash_limit")) return "CASH_LIMIT";
+  return "NO_ELIGIBLE_TARGET";
 }
 
 export function planMonthlyRebalance({
@@ -472,6 +625,7 @@ export function planMonthlyRebalance({
   );
   const positionValues = new Map();
   const sectorValues = new Map();
+  const positionKeys = new Set();
   for (const position of positions) {
     const key = portfolioSecurityKey(position);
     const evaluation = evaluations.get(key);
@@ -482,6 +636,12 @@ export function planMonthlyRebalance({
     const sector = String(position.sector || evaluation?.sector || "미분류");
     positionValues.set(key, value);
     sectorValues.set(sector, (sectorValues.get(sector) || 0) + value);
+    if (
+      (positive(position.quantity) || 0) > 0 ||
+      value > 0
+    ) {
+      positionKeys.add(key);
+    }
   }
   const nextStreaks = { ...previousStreaks };
   const candidates = [];
@@ -500,6 +660,24 @@ export function planMonthlyRebalance({
   const turnoverCapWeight = cashDeploymentOnly
     ? Math.min(regularTurnoverCapWeight, cashKrw / equity)
     : regularTurnoverCapWeight;
+  const reserveKrw =
+    equity * Math.max(policy.reserveWeight, portfolio.cashTargetWeight || 0);
+  const startingDeployableCashKrw = Math.max(0, cashKrw - reserveKrw);
+  const cashDeploymentActive =
+    !cashDeploymentOnly &&
+    initialDeploymentCompleted &&
+    policy.deployAvailableCash &&
+    startingDeployableCashKrw > 0;
+  const sellTurnoverCapKrw = equity * turnoverCapWeight;
+  const buyTurnoverCapKrw = cashDeploymentActive
+    ? Math.max(sellTurnoverCapKrw, startingDeployableCashKrw)
+    : sellTurnoverCapKrw;
+  // Preserve the legacy shared gross ceiling unless automatic cash
+  // deployment is active. When active, buys funded by cash that existed at
+  // plan start have their own budget, while sells keep the routine ceiling.
+  const grossTurnoverCapKrw = cashDeploymentActive
+    ? buyTurnoverCapKrw + sellTurnoverCapKrw
+    : sellTurnoverCapKrw;
 
   if (!cashDeploymentOnly) {
     for (const selectedCompany of selected) {
@@ -610,13 +788,16 @@ export function planMonthlyRebalance({
   const limited = applyTurnoverAndCashLimits(candidates, {
     equity,
     cashKrw,
-    reserveKrw: equity * Math.max(policy.reserveWeight, portfolio.cashTargetWeight || 0),
-    maximumTurnoverKrw: equity * turnoverCapWeight,
+    reserveKrw,
+    maximumTurnoverKrw: grossTurnoverCapKrw,
+    maximumBuyTurnoverKrw: buyTurnoverCapKrw,
+    maximumSellTurnoverKrw: sellTurnoverCapKrw,
     maximumOrders: policy.maximumOrdersPerRun,
     policy,
     sweepCandidates,
     positionValues,
-    sectorValues
+    sectorValues,
+    positionKeys
   });
   const nextState = withStrategyState(
     state,
@@ -631,6 +812,14 @@ export function planMonthlyRebalance({
           initialDeploymentCompleted
         }
   );
+  const allSkipped = [...skipped, ...limited.skipped];
+  const cashDeploymentResidualCode = automaticCashResidualCode({
+    active: cashDeploymentActive,
+    availableCashAfterKrw: limited.availableCashAfterKrw,
+    minimumOrderKrw: policy.minimumOrderKrw,
+    skipped: allSkipped,
+    residualBlockers: limited.residualBlockers
+  });
 
   return {
     status: "planned",
@@ -638,17 +827,29 @@ export function planMonthlyRebalance({
     nextState,
     diagnostics: {
       candidates: candidates.length,
-      skipped: [...skipped, ...limited.skipped],
+      skipped: allSkipped,
       turnoverKrw: limited.turnoverKrw,
       turnoverWeight: limited.turnoverWeight,
       turnoverCapWeight,
+      buyTurnoverKrw: limited.buyTurnoverKrw,
+      buyTurnoverWeight: limited.buyTurnoverWeight,
+      buyTurnoverCapKrw,
+      buyTurnoverCapWeight: buyTurnoverCapKrw / equity,
+      sellTurnoverKrw: limited.sellTurnoverKrw,
+      sellTurnoverWeight: limited.sellTurnoverWeight,
+      sellTurnoverCapKrw,
+      sellTurnoverCapWeight: sellTurnoverCapKrw / equity,
+      grossTurnoverCapKrw,
+      grossTurnoverCapWeight: grossTurnoverCapKrw / equity,
       deploymentPhase: initialDeploymentCompleted ? "routine" : "initial",
       currentInvestedWeight,
       targetInvestedWeight: portfolioTargetWeight,
       estimatedCashAfterKrw: limited.estimatedCashAfterKrw,
-      reserveKrw: equity * Math.max(policy.reserveWeight, portfolio.cashTargetWeight || 0),
+      reserveKrw,
       rebalanceFrequency: policy.rebalanceFrequency,
       reuseProjectedSellProceeds: policy.reuseProjectedSellProceeds,
+      cashDeploymentActive,
+      cashDeploymentResidualCode,
       cashDeploymentOnly
     }
   };

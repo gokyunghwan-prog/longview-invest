@@ -16,6 +16,9 @@ function stepBlock(workflow, name, nextName) {
 
 test("daily sync verifies every configured price provider before selection or publication", async () => {
   const workflow = await readFile(workflowUrl, "utf8");
+  assert.match(workflow, /cron: "35 10,13,16 \* \* \*"/);
+  assert.match(workflow, /timeout-minutes: 120/);
+  assert.match(workflow, /cancel-in-progress: false/);
   const syncAt = workflow.indexOf("      - name: Sync KOSPI and KOSDAQ");
   const pricesAt = workflow.indexOf(
     "      - name: Verify configured price providers before publishing"
@@ -25,11 +28,13 @@ test("daily sync verifies every configured price provider before selection or pu
   );
   const validationAt = workflow.indexOf("      - name: Validate generated snapshot");
   const commitAt = workflow.indexOf("      - name: Commit updated public snapshot");
+  const cacheSaveAt = workflow.indexOf("      - name: Save DART universe checkpoints");
 
   assert.ok(syncAt < pricesAt, "price verification must run after the sync diagnostics exist");
   assert.ok(pricesAt < selectionAt, "selection must not be generated before price verification");
   assert.ok(selectionAt < validationAt, "snapshot validation must follow selection generation");
   assert.ok(validationAt < commitAt, "publication must be the final guarded data step");
+  assert.ok(commitAt < cacheSaveAt, "checkpoint caching must not block a valid publication");
 
   const priceStep = stepBlock(
     workflow,
@@ -51,9 +56,17 @@ test("daily sync verifies every configured price provider before selection or pu
   const validationStep = stepBlock(
     workflow,
     "Validate generated snapshot",
-    "Save DART universe checkpoints"
+    "Upload sync diagnostics"
   );
   assert.match(validationStep, /steps\.price_validation\.outcome == 'success'/);
+
+  const cacheSaveStep = stepBlock(
+    workflow,
+    "Save DART universe checkpoints",
+    "Fail when the Korean market collector failed"
+  );
+  assert.match(cacheSaveStep, /if: always\(\)/);
+  assert.match(cacheSaveStep, /continue-on-error: true/);
 
   const commitStep = stepBlock(
     workflow,
@@ -63,6 +76,8 @@ test("daily sync verifies every configured price provider before selection or pu
   assert.match(commitStep, /steps\.price_validation\.outcome == 'success'/);
   assert.match(commitStep, /git add data\/companies\.json data\/trading-selection\.json/);
   assert.match(commitStep, /git push/);
+  assert.doesNotMatch(workflow, /dedupe-generated-snapshot/);
+  assert.doesNotMatch(workflow, /previous-trading-selection/);
 
   const failureStep = stepBlock(
     workflow,

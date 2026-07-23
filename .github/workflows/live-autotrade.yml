@@ -2,8 +2,9 @@ name: Encrypted Korean live autotrade
 
 on:
   schedule:
-    # GitHub cron is UTC: 00:23 UTC = 09:23 KST on weekdays.
-    - cron: "23 0 * * 1-5"
+    # GitHub schedules may be delayed. A half-hour heartbeat safely skips outside
+    # 09:05-14:50 KST and shares one idempotent trade cycle inside the window.
+    - cron: "17,47 * * * 1-5"
     # 06:13 UTC = 15:13 KST. Reconcile and cancel remaining open orders.
     - cron: "13 6 * * 1-5"
   workflow_dispatch:
@@ -57,6 +58,7 @@ jobs:
       TRADING_USE_ALL_DEDICATED_ACCOUNT_ASSETS: "true"
       TRADING_INITIAL_DEPLOYMENT_TURNOVER_PERCENT: "100"
       TRADING_MAX_TURNOVER_PERCENT: "20"
+      TRADING_AUTODEPLOY_CASH: "true"
       TRADING_MAX_ORDERS_PER_RUN: "10"
       TRADING_REBALANCE_DRIFT_PERCENT: "3"
       TRADING_REMOVAL_CONFIRMATIONS: "2"
@@ -89,7 +91,7 @@ jobs:
       - name: Validate the runner and its safety contracts
         run: |
           node --check scripts/cloud-autotrade.mjs
-          node --test tests/autotrade-cloud-state.test.mjs tests/autotrade-cloud-runner.test.mjs tests/autotrade-engine.test.mjs tests/autotrade-kis.test.mjs tests/autotrade-planner.test.mjs tests/autotrade-reconciliation.test.mjs tests/autotrade-risk.test.mjs tests/autotrade-state-paper.test.mjs tests/autotrade-strategy.test.mjs tests/autotrade-trusted-clock.test.mjs
+          node --test tests/autotrade-cloud-state.test.mjs tests/autotrade-cloud-runner.test.mjs tests/autotrade-config.test.mjs tests/autotrade-engine.test.mjs tests/autotrade-kis.test.mjs tests/autotrade-planner.test.mjs tests/autotrade-reconciliation.test.mjs tests/autotrade-risk.test.mjs tests/autotrade-state-paper.test.mjs tests/autotrade-strategy.test.mjs tests/autotrade-trusted-clock.test.mjs tests/live-autotrade-workflow.test.mjs
 
       - name: Start the read-only Longview ranking API
         run: |
@@ -138,9 +140,9 @@ jobs:
           CLOUD_LIVE_TRADING_ACK: ${{ secrets.CLOUD_LIVE_TRADING_ACK }}
           CLOUD_MANUAL_LIVE_CONFIRM: "false"
 
-      - name: Scheduled morning trade
-        if: github.event_name == 'schedule' && github.event.schedule == '23 0 * * 1-5'
-        run: node scripts/cloud-autotrade.mjs trade
+      - name: Scheduled idempotent trade heartbeat
+        if: github.event_name == 'schedule' && github.event.schedule == '17,47 * * * 1-5'
+        run: node scripts/cloud-autotrade.mjs auto
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           AUTOTRADE_STATE_KEY: ${{ secrets.AUTOTRADE_STATE_KEY }}
@@ -153,7 +155,7 @@ jobs:
           USE_ALL_DEDICATED_ACCOUNT_ASSETS_ACK: ${{ secrets.USE_ALL_DEDICATED_ACCOUNT_ASSETS_ACK }}
           UNATTENDED_LIVE_TRADING_ACK: ${{ secrets.UNATTENDED_LIVE_TRADING_ACK }}
           CLOUD_LIVE_TRADING_ACK: ${{ secrets.CLOUD_LIVE_TRADING_ACK }}
-          CLOUD_EVENT_SCHEDULE: "23 0 * * 1-5"
+          CLOUD_EVENT_SCHEDULE: "17,47 * * * 1-5"
 
       - name: Scheduled afternoon reconciliation
         if: github.event_name == 'schedule' && github.event.schedule == '13 6 * * 1-5'
