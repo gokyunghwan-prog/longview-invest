@@ -19,6 +19,7 @@ import {
   prepareRuntimeSnapshot,
   refreshRemoteFullSnapshot
 } from "./lib/remote-snapshot.mjs";
+import { refreshRemoteArtifactBundle } from "./lib/remote-artifact-bundle.mjs";
 import { syncAll } from "./lib/sync.mjs";
 
 const MIME_TYPES = {
@@ -138,17 +139,22 @@ export async function createLongviewApp(
     runtimeSnapshotPreparer = prepareRuntimeSnapshot,
     remoteSnapshotRefresher = refreshRemoteFullSnapshot,
     runtimeSelectionPreparer = prepareRuntimeInvestmentSelection,
-    remoteSelectionRefresher = refreshRemoteInvestmentSelection
+    remoteSelectionRefresher = refreshRemoteInvestmentSelection,
+    remoteBundleRefresher = refreshRemoteArtifactBundle
   } = {}
 ) {
-  const remoteMode = Boolean(config.remoteSnapshotUrl && !companyStore);
+  const remoteMode = Boolean(
+    (config.remoteSnapshotUrl || config.remoteArtifactManifestUrl) &&
+    !companyStore
+  );
+  const remoteBundleMode = Boolean(config.remoteArtifactManifestUrl && !companyStore);
   const preparedRuntime = remoteMode
     ? await runtimeSnapshotPreparer(config)
     : null;
   const store = companyStore ||
     (await createCompanyStore(preparedRuntime?.dataFile || config.dataFile, storeOptions));
   const preparedSelection =
-    remoteMode && config.remoteInvestmentSelectionUrl
+    remoteMode && (config.remoteInvestmentSelectionUrl || remoteBundleMode)
       ? await runtimeSelectionPreparer(config)
       : null;
   const investmentSelectionFile = preparedSelection?.file ||
@@ -171,6 +177,8 @@ export async function createLongviewApp(
   };
 
   async function refreshStore() {
+    const currentRemoteRefresh = activeRemoteRefresh;
+    if (currentRemoteRefresh) await currentRemoteRefresh;
     await store.refreshIfChanged();
   }
 
@@ -184,23 +192,25 @@ export async function createLongviewApp(
       remoteSnapshotStatus.lastAttemptAt = new Date().toISOString();
       remoteSnapshotStatus.status = "refreshing";
       try {
-        const result = await remoteSnapshotRefresher(config, {
-          etag: remoteEtag,
-          onProgress: (message) =>
-            console.log("[" + new Date().toISOString() + "] " + message)
-        });
+        const result = remoteBundleMode
+          ? await remoteBundleRefresher(config)
+          : await remoteSnapshotRefresher(config, {
+              etag: remoteEtag,
+              onProgress: (message) =>
+                console.log("[" + new Date().toISOString() + "] " + message)
+            });
         if (!result?.success) {
-          throw new Error(result?.error || "GitHub 최신 snapshot을 받지 못했습니다.");
+          throw new Error(result?.error || "최신 snapshot을 받지 못했습니다.");
         }
         if (result.etag) remoteEtag = result.etag;
         if (result.changed) await store.reload();
-        if (config.remoteInvestmentSelectionUrl) {
+        if (!remoteBundleMode && config.remoteInvestmentSelectionUrl) {
           const selectionResult = await remoteSelectionRefresher(config, {
             expectedRevision: store.getStatus().revision
           });
           if (!selectionResult?.success) {
             throw new Error(
-              selectionResult?.error || "GitHub 최신 투자선정 파일을 받지 못했습니다."
+              selectionResult?.error || "최신 투자선정 파일을 받지 못했습니다."
             );
           }
         }
@@ -216,7 +226,7 @@ export async function createLongviewApp(
         remoteSnapshotStatus.status = "stale";
         remoteSnapshotStatus.error = message;
         if (throwOnFailure) throw new Error(message);
-        console.error("GitHub 최신 snapshot 확인 실패, 마지막 정상 데이터 유지:", message);
+        console.error("최신 snapshot 확인 실패, 마지막 정상 데이터 유지:", message);
         return { attempted: true, success: false, changed: false, error: message };
       }
     })().finally(() => {
@@ -231,7 +241,7 @@ export async function createLongviewApp(
       activeSync = (async () => {
         const result = await refreshRemoteStore();
         if (!result.success) {
-          throw new Error(result.error || "GitHub 최신 snapshot을 받지 못했습니다.");
+          throw new Error(result.error || "최신 snapshot을 받지 못했습니다.");
         }
         return result;
       })().finally(() => {
@@ -476,6 +486,9 @@ export async function createLongviewApp(
   });
 
   async function listen({ port = config.port, host = config.host } = {}) {
+    if (remoteMode && config.remoteStartupRefreshRequired) {
+      await refreshRemoteStore({ throwOnFailure: true });
+    }
     await new Promise((resolve, reject) => {
       const onError = (error) => {
         server.off("listening", onListening);
@@ -502,7 +515,7 @@ export async function createLongviewApp(
         void refreshRemoteStore();
       }, refreshIntervalMs);
       remoteRefreshTimer.unref();
-      void refreshRemoteStore();
+      if (!config.remoteStartupRefreshRequired) void refreshRemoteStore();
     }
     return server.address();
   }
@@ -545,7 +558,9 @@ if (isMainModule()) {
   console.log(
     "Longview 서버: http://" + config.host + ":" + config.port +
       (config.remoteSnapshotUrl
-        ? " · GitHub 최신 snapshot 시작 즉시·30분마다 자동 확인"
+        ? " · 원격 최신 snapshot 시작 즉시·30분마다 자동 확인"
+        : config.remoteArtifactManifestUrl
+        ? " · AWS 검증 artifact 시작 즉시·30분마다 자동 확인"
         : config.schedulerEnabled
         ? " · 매일 " + config.scheduleHourKst + "시(KST) 자동 갱신"
         : " · 서버 스케줄러 꺼짐")

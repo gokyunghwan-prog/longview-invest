@@ -24,9 +24,18 @@
     "trade:resolve-pending": "node scripts/autotrade.mjs resolve-pending",
     "trade:verify-kis": "node scripts/verify-kis-connection.mjs",
     "trade:start": "node autotrade/server.mjs",
-    "check": "node --check server.mjs && node --check public/app.js && node --check autotrade/server.mjs && node --check scripts/autotrade.mjs && node --check scripts/cloud-autotrade.mjs && node --check scripts/generate-investment-selection.mjs && node --check scripts/verify-kis-connection.mjs && node --check scripts/sync-daily-markets.mjs && node --check scripts/sync-stock-prices.mjs && node --check scripts/verify-price-sync.mjs && node --check scripts/normalize-korean-snapshot.mjs && node --check scripts/validate-snapshot.mjs && node --test"
+    "aws:task": "node scripts/aws-task.mjs",
+    "aws:bootstrap": "node scripts/aws-bootstrap.mjs",
+    "check": "node --check server.mjs && node --check public/app.js && node --check autotrade/server.mjs && node --check autotrade/aws/runner.mjs && node --check autotrade/aws/bootstrap.mjs && node --check lib/aws-artifacts.mjs && node --check lib/remote-artifact-bundle.mjs && node --check scripts/aws-task.mjs && node --check scripts/aws-bootstrap.mjs && node --check scripts/autotrade.mjs && node --check scripts/cloud-autotrade.mjs && node --check scripts/generate-investment-selection.mjs && node --check scripts/verify-kis-connection.mjs && node --check scripts/sync-daily-markets.mjs && node --check scripts/sync-stock-prices.mjs && node --check scripts/verify-price-sync.mjs && node --check scripts/normalize-korean-snapshot.mjs && node --check scripts/validate-snapshot.mjs && node --test"
   },
   "engines": {
     "node": ">=20"
+  },
+  "dependencies": {
+    "@aws-sdk/client-dynamodb": "3.1094.0",
+    "@aws-sdk/client-s3": "3.1094.0",
+    "@aws-sdk/client-secrets-manager": "3.1094.0",
+    "@aws-sdk/client-ssm": "3.1094.0",
+    "@aws-sdk/lib-dynamodb": "3.1094.0"
   }
 }
