@@ -1080,48 +1080,14 @@ test("공개 최상위 실패 출력은 원문 대신 allowlisted category만 �
   });
 });
 
-test("GitHub workflow는 비활성 기본값·고정 SHA·멱등 heartbeat와 조정 일정을 유지한다", async () => {
+test("GitHub 실거래 workflow는 AWS 이전을 위해 주문 불가능한 stub으로 고정된다", async () => {
   const workflow = await readFile(
     new URL("../.github/workflows/live-autotrade.yml", import.meta.url),
     "utf8"
   );
-  assert.match(workflow, /cron: "17,47 \* \* \* 1-5"/);
-  assert.match(workflow, /cron: "13 6 \* \* 1-5"/);
-  assert.match(workflow, /node scripts\/cloud-autotrade\.mjs auto/);
-  assert.match(workflow, /CLOUD_EVENT_SCHEDULE: "17,47 \* \* \* 1-5"/);
-  assert.match(workflow, /vars\.AUTOTRADE_LIVE_ENABLED == 'true'/);
-  assert.match(workflow, /github\.ref == 'refs\/heads\/main'/);
+  assert.match(workflow, /Retired GitHub live autotrade/);
+  assert.match(workflow, /workflow_dispatch:/);
+  assert.match(workflow, /contents: read/);
   assert.match(workflow, /cancel-in-progress: false/);
-  assert.match(
-    workflow,
-    /actions\/checkout@11d5960a326750d5838078e36cf38b85af677262/
-  );
-  assert.match(
-    workflow,
-    /actions\/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020/
-  );
-  assert.doesNotMatch(workflow, /uses:\s*actions\/(?:checkout|setup-node)@v\d+/);
-  assert.match(workflow, /with:\s*\n\s+ref: main\s*\n\s+persist-credentials: false/);
-  assert.match(workflow, /TRADING_REQUIRE_PUBLISHED_SELECTION: "true"/);
-  assert.match(workflow, /TRADING_CASH_RESERVE_PERCENT: "0"/);
-  assert.match(workflow, /TRADING_CAPITAL_LIMIT_KRW: "0"/);
-  assert.match(workflow, /TRADING_USE_ALL_DEDICATED_ACCOUNT_ASSETS: "true"/);
-  assert.match(workflow, /TRADING_AUTODEPLOY_CASH: "true"/);
-  assert.match(workflow, /tests\/autotrade-engine\.test\.mjs/);
-  assert.match(workflow, /tests\/autotrade-planner\.test\.mjs/);
-  assert.match(workflow, /tests\/autotrade-risk\.test\.mjs/);
-  assert.match(workflow, /tests\/autotrade-state-paper\.test\.mjs/);
-  assert.match(workflow, /tests\/autotrade-strategy\.test\.mjs/);
-  assert.match(workflow, /tests\/autotrade-trusted-clock\.test\.mjs/);
-  assert.match(
-    workflow,
-    /USE_ALL_DEDICATED_ACCOUNT_ASSETS_ACK: \$\{\{ secrets\.USE_ALL_DEDICATED_ACCOUNT_ASSETS_ACK \}\}/
-  );
-  assert.match(workflow, /default: plan/);
-  assert.match(workflow, /default: false/);
-  assert.match(workflow, /- topup/);
-  assert.match(workflow, /- topup-plan/);
-  assert.match(workflow, /node scripts\/cloud-autotrade\.mjs topup-plan/);
-  assert.match(workflow, /node scripts\/cloud-autotrade\.mjs topup/);
-  assert.match(workflow, /CLOUD_MANUAL_TOPUP_ID: \$\{\{ github\.run_id \}\}/);
+  assert.doesNotMatch(workflow, /schedule:|cloud-autotrade|secrets\.|KIS_/);
 });

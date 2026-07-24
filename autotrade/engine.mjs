@@ -496,7 +496,8 @@ export class TradingEngine {
       now = () => new Date(),
       timeBounds = null,
       beforePersist = null,
-      beforeOrder = null
+      beforeOrder = null,
+      killSwitch = null
     } = {}
   ) {
     if (timeBounds !== null && typeof timeBounds !== "function") {
@@ -508,6 +509,9 @@ export class TradingEngine {
     if (beforeOrder !== null && typeof beforeOrder !== "function") {
       throw new TypeError("주문 직전 원격 안전 확인은 함수여야 합니다.");
     }
+    if (killSwitch !== null && typeof killSwitch !== "function") {
+      throw new TypeError("긴급 정지 확인은 함수여야 합니다.");
+    }
     this.config = config;
     this.client = client;
     this.stateStore = stateStore;
@@ -516,7 +520,19 @@ export class TradingEngine {
     this.timeBounds = timeBounds;
     this.beforePersist = beforePersist;
     this.beforeOrder = beforeOrder;
+    this.killSwitch = killSwitch;
     this.killSwitchFile = path.join(config.stateDir, "KILL_SWITCH");
+  }
+
+  async killSwitchActive() {
+    if (!this.killSwitch) return fileExists(this.killSwitchFile);
+    const active = await this.killSwitch();
+    if (typeof active !== "boolean") {
+      const error = new Error("긴급 정지 확인 결과가 올바르지 않습니다.");
+      error.code = "TRADING_KILL_SWITCH_INVALID";
+      throw error;
+    }
+    return active;
   }
 
   currentTimeBounds() {
@@ -533,7 +549,7 @@ export class TradingEngine {
     return {
       state,
       lastRun: state.runs.at(-1) || null,
-      killSwitchActive: await fileExists(this.killSwitchFile)
+      killSwitchActive: await this.killSwitchActive()
     };
   }
 
@@ -588,7 +604,7 @@ export class TradingEngine {
       };
     }
     const blockedReasons = [];
-    if (await fileExists(this.killSwitchFile)) blockedReasons.push("긴급 정지 스위치가 켜져 있습니다.");
+    if (await this.killSwitchActive()) blockedReasons.push("긴급 정지 스위치가 켜져 있습니다.");
     if (state.strategy.inFlight) {
       blockedReasons.push(
         `확인이 끝나지 않은 이전 주문 실행이 있습니다(${state.strategy.inFlight.cycleKey}).`
@@ -808,7 +824,7 @@ export class TradingEngine {
   }
 
   async assertKillSwitchInactive() {
-    if (await fileExists(this.killSwitchFile)) {
+    if (await this.killSwitchActive()) {
       const error = new Error("긴급 정지 스위치가 켜져 있어 주문을 중단했습니다.");
       error.code = "TRADING_KILL_SWITCH";
       throw error;

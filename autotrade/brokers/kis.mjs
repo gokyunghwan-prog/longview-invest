@@ -16,6 +16,7 @@ const DOMESTIC_ORDER_PATH = "/uapi/domestic-stock/v1/trading/order-cash";
 const DOMESTIC_QUOTE_PATH = "/uapi/domestic-stock/v1/quotations/inquire-price";
 const DOMESTIC_DAILY_PRICE_PATH =
   "/uapi/domestic-stock/v1/quotations/inquire-daily-price";
+const DOMESTIC_HOLIDAY_PATH = "/uapi/domestic-stock/v1/quotations/chk-holiday";
 const DOMESTIC_BUYABLE_PATH = "/uapi/domestic-stock/v1/trading/inquire-psbl-order";
 const DOMESTIC_DAILY_ORDERS_PATH = "/uapi/domestic-stock/v1/trading/inquire-daily-ccld";
 const DOMESTIC_CANCELABLE_ORDERS_PATH =
@@ -477,7 +478,8 @@ export class KisBroker {
       maximumBalanceRows = DEFAULT_MAX_BALANCE_ROWS,
       readRateLimitRetries = DEFAULT_READ_RATE_LIMIT_RETRIES,
       readRateLimitBackoffMs = DEFAULT_READ_RATE_LIMIT_BACKOFF_MS,
-      tokenExpirySkewMs = TOKEN_EXPIRY_SKEW_MS
+      tokenExpirySkewMs = TOKEN_EXPIRY_SKEW_MS,
+      tokenCache = null
     } = {}
   ) {
     if (typeof fetchImpl !== "function") throw new TypeError("fetch 구현이 필요합니다.");
@@ -518,6 +520,16 @@ export class KisBroker {
     if (typeof AbortController !== "function") {
       throw new Error("KIS 요청 제한시간을 적용하려면 AbortController가 필요합니다.");
     }
+    if (
+      tokenCache !== null &&
+      (
+        typeof tokenCache !== "object" ||
+        typeof tokenCache.load !== "function" ||
+        typeof tokenCache.save !== "function"
+      )
+    ) {
+      throw new TypeError("KIS 토큰 캐시는 load와 save 함수를 제공해야 합니다.");
+    }
 
     this.name = "kis";
     this.environment = environment;
@@ -541,9 +553,11 @@ export class KisBroker {
     this.readRateLimitRetries = readRateLimitRetries;
     this.readRateLimitBackoffMs = readRateLimitBackoffMs;
     this.tokenExpirySkewMs = Math.max(0, finiteNumber(tokenExpirySkewMs));
+    this.tokenCache = tokenCache;
 
     this.accessToken = "";
     this.accessTokenExpiresAt = 0;
+    this.tokenCacheLoaded = false;
     this.tokenPromise = null;
     this.networkChain = Promise.resolve();
     this.lastRequestStartedAt = Number.NEGATIVE_INFINITY;
@@ -720,7 +734,54 @@ export class KisBroker {
     const expiresInSeconds = Math.max(1, finiteNumber(body?.expires_in, 86_400));
     this.accessToken = token;
     this.accessTokenExpiresAt = issuedAt + expiresInSeconds * 1_000;
+    if (this.tokenCache) {
+      try {
+        await this.tokenCache.save({
+          accessToken: token,
+          expiresAt: this.accessTokenExpiresAt
+        });
+      } catch {
+        this.clearToken();
+        throw new KisApiError("KIS 접근토큰을 영구 캐시에 저장하지 못했습니다.", {
+          code: "KIS_TOKEN_CACHE_SAVE_FAILED"
+        });
+      }
+    }
     return token;
+  }
+
+  async _loadCachedAccessToken() {
+    if (!this.tokenCache || this.tokenCacheLoaded) return;
+    this.tokenCacheLoaded = true;
+    let cached;
+    try {
+      cached = await this.tokenCache.load();
+    } catch {
+      throw new KisApiError("KIS 접근토큰 영구 캐시를 읽지 못했습니다.", {
+        code: "KIS_TOKEN_CACHE_LOAD_FAILED"
+      });
+    }
+    const token = cleanText(cached?.accessToken);
+    const expiresAt = Number(cached?.expiresAt);
+    if (
+      token &&
+      Number.isFinite(expiresAt) &&
+      this._now() < expiresAt - this.tokenExpirySkewMs
+    ) {
+      this.accessToken = token;
+      this.accessTokenExpiresAt = expiresAt;
+    }
+  }
+
+  async _resolveAccessToken() {
+    await this._loadCachedAccessToken();
+    if (
+      this.accessToken &&
+      this._now() < this.accessTokenExpiresAt - this.tokenExpirySkewMs
+    ) {
+      return this.accessToken;
+    }
+    return this._issueAccessToken();
   }
 
   async _getAccessToken() {
@@ -732,7 +793,7 @@ export class KisBroker {
     }
     if (this.tokenPromise) return this.tokenPromise;
 
-    const pending = this._issueAccessToken();
+    const pending = this._resolveAccessToken();
     this.tokenPromise = pending;
     try {
       return await pending;
@@ -976,6 +1037,40 @@ export class KisBroker {
     const quotes = [];
     for (const company of companies) quotes.push(await this.getQuote(company));
     return quotes;
+  }
+
+  async getTradingDayStatus(date = kstBusinessDate(this._now())) {
+    const businessDate = dailyOrderQueryDate(date, "휴장일 조회 기준일").value;
+    const payload = await this._readRequest(DOMESTIC_HOLIDAY_PATH, {
+      trId: "CTCA0903R",
+      query: {
+        BASS_DT: businessDate,
+        CTX_AREA_FK: "",
+        CTX_AREA_NK: ""
+      }
+    });
+    const row = asRows(payload.output).find(
+      (item) => cleanText(item?.bass_dt) === businessDate
+    );
+    const open = cleanText(row?.opnd_yn).toUpperCase();
+    const trading = cleanText(row?.tr_day_yn).toUpperCase();
+    const optionalFlag = (value) => {
+      const normalized = cleanText(value).toUpperCase();
+      return ["Y", "N"].includes(normalized) ? normalized === "Y" : null;
+    };
+    if (!row || !["Y", "N"].includes(open)) {
+      throw new KisApiError("KIS 국내휴장일 응답에서 요청한 날짜를 확인하지 못했습니다.", {
+        code: "KIS_TRADING_DAY_INVALID"
+      });
+    }
+    return {
+      businessDate,
+      businessDay: optionalFlag(row.bzdy_yn),
+      tradingDay: ["Y", "N"].includes(trading) ? trading === "Y" : null,
+      marketOpen: open === "Y",
+      settlementDay: optionalFlag(row.sttl_day_yn),
+      canPlaceOrders: open === "Y"
+    };
   }
 
   async getBuyableOrder(order) {

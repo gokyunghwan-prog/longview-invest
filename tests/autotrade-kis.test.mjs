@@ -139,6 +139,130 @@ test("동시 요청은 OAuth 토큰을 한 번만 발급하고 만료 전까지 
   assert.equal(tokenCalls, 2, "만료 안전 여유시간에 들어오면 토큰을 갱신해야 한다");
 });
 
+test("영구 캐시의 유효한 KIS 토큰을 쓰고 OAuth 재발급을 생략한다", async () => {
+  const calls = [];
+  let saves = 0;
+  const broker = new KisBroker(CONFIG, {
+    now: () => 1_000,
+    minimumIntervalMs: 0,
+    tokenCache: {
+      async load() {
+        return { accessToken: "durable-token", expiresAt: 300_000 };
+      },
+      async save() {
+        saves += 1;
+      }
+    },
+    fetchImpl: async (url, options) => {
+      calls.push({ url, options });
+      assert.doesNotMatch(url, /oauth2\/tokenP$/);
+      return successfulBalanceResponse();
+    }
+  });
+
+  await broker.getDomesticBalance();
+
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].options.headers.authorization, "Bearer durable-token");
+  assert.equal(saves, 0);
+});
+
+test("새 KIS 토큰의 영구 캐시 저장 실패는 후속 API 호출 전에 닫힌다", async () => {
+  let tokenCalls = 0;
+  let balanceCalls = 0;
+  const broker = new KisBroker(CONFIG, {
+    now: () => 1_000,
+    minimumIntervalMs: 0,
+    tokenCache: {
+      async load() {
+        return null;
+      },
+      async save() {
+        throw new Error("durable cache unavailable");
+      }
+    },
+    fetchImpl: async (url) => {
+      if (url.endsWith("/oauth2/tokenP")) {
+        tokenCalls += 1;
+        return tokenResponse("must-not-remain-in-memory");
+      }
+      balanceCalls += 1;
+      return successfulBalanceResponse();
+    }
+  });
+
+  await assert.rejects(broker.getDomesticBalance(), {
+    code: "KIS_TOKEN_CACHE_SAVE_FAILED"
+  });
+  assert.equal(tokenCalls, 1);
+  assert.equal(balanceCalls, 0);
+  assert.equal(broker.accessToken, "");
+});
+
+test("KIS 휴장일 조회는 요청일의 개장·거래 여부를 함께 확인한다", async () => {
+  const calls = [];
+  const broker = new KisBroker(CONFIG, {
+    minimumIntervalMs: 0,
+    fetchImpl: async (url, options) => {
+      calls.push({ url, options });
+      if (url.endsWith("/oauth2/tokenP")) return tokenResponse("holiday-token");
+      return jsonResponse({
+        rt_cd: "0",
+        msg_cd: "MCA00000",
+        msg1: "정상",
+        output: [
+          {
+            bass_dt: "20260724",
+            bzdy_yn: "Y",
+            tr_day_yn: "Y",
+            opnd_yn: "Y",
+            sttl_day_yn: "Y"
+          }
+        ]
+      });
+    }
+  });
+
+  const status = await broker.getTradingDayStatus("20260724");
+
+  assert.deepEqual(status, {
+    businessDate: "20260724",
+    businessDay: true,
+    tradingDay: true,
+    marketOpen: true,
+    settlementDay: true,
+    canPlaceOrders: true
+  });
+  const request = calls[1];
+  const url = new URL(request.url);
+  assert.equal(url.pathname, "/uapi/domestic-stock/v1/quotations/chk-holiday");
+  assert.equal(url.searchParams.get("BASS_DT"), "20260724");
+  assert.equal(request.options.headers.tr_id, "CTCA0903R");
+});
+
+test("KIS 휴장일 응답에 요청일 또는 Y/N 필드가 없으면 주문 가능으로 추정하지 않는다", async () => {
+  for (const output of [
+    [{ bass_dt: "20260723", bzdy_yn: "Y", tr_day_yn: "Y", opnd_yn: "Y" }],
+    [{ bass_dt: "20260724", bzdy_yn: "Y", tr_day_yn: "Y", opnd_yn: "" }]
+  ]) {
+    const broker = new KisBroker(CONFIG, {
+      minimumIntervalMs: 0,
+      fetchImpl: async (url) =>
+        url.endsWith("/oauth2/tokenP")
+          ? tokenResponse("holiday-invalid-token")
+          : jsonResponse({
+              rt_cd: "0",
+              msg_cd: "MCA00000",
+              msg1: "정상",
+              output
+            })
+    });
+    await assert.rejects(broker.getTradingDayStatus("20260724"), {
+      code: "KIS_TRADING_DAY_INVALID"
+    });
+  }
+});
+
 test("prod 국내 지정가 매수·매도는 올바른 URL, 헤더, TR ID와 대문자 Body를 쓴다", async () => {
   const calls = [];
   const fetchImpl = async (url, options) => {
