@@ -1,8 +1,8 @@
 {
   "schemaVersion": 1,
-  "generatedAt": "2026-07-25T15:05:09.992Z",
-  "sourceRevision": "2bc574364691f9afc7ae",
-  "sourceUpdatedAt": "2026-07-25T15:04:55.094Z",
+  "generatedAt": "2026-07-25T20:32:55.386Z",
+  "sourceRevision": "b84213f46b6be60b4578",
+  "sourceUpdatedAt": "2026-07-25T20:32:43.722Z",
   "modelVersion": "2.0.0",
   "strategyVersion": "longview-domestic-capital-aware-v2",
   "policy": {
