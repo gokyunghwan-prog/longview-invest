@@ -118,6 +118,10 @@ function validateState(state) {
   return state;
 }
 
+export function validateTradingState(state) {
+  return validateState(structuredClone(state));
+}
+
 async function writeAtomic(file, payload) {
   await mkdir(path.dirname(file), { recursive: true });
   const temporary = `${file}.tmp-${process.pid}-${randomUUID()}`;
@@ -143,11 +147,15 @@ export class TradingStateStore {
       pid = process.pid,
       isProcessAlive = processIsAlive,
       orphanGraceMs = RUN_LOCK_ORPHAN_GRACE_MS,
-      onStateCommitted = null
+      onStateCommitted = null,
+      onAuditAppended = null
     } = {}
   ) {
     if (onStateCommitted !== null && typeof onStateCommitted !== "function") {
       throw new TypeError("상태 저장 후 콜백은 함수여야 합니다.");
+    }
+    if (onAuditAppended !== null && typeof onAuditAppended !== "function") {
+      throw new TypeError("감사 로그 저장 후 콜백은 함수여야 합니다.");
     }
     this.directory = directory;
     this.stateFile = path.join(directory, "state.json");
@@ -164,6 +172,7 @@ export class TradingStateStore {
     this.isProcessAlive = isProcessAlive;
     this.orphanGraceMs = orphanGraceMs;
     this.onStateCommitted = onStateCommitted;
+    this.onAuditAppended = onAuditAppended;
     this.state = null;
     this.writeChain = Promise.resolve();
   }
@@ -220,6 +229,9 @@ export class TradingStateStore {
     };
     const line = JSON.stringify(safeEntry) + "\n";
     await writeFile(this.auditFile, line, { encoding: "utf8", flag: "a" });
+    if (this.onAuditAppended) {
+      await this.onAuditAppended(structuredClone(safeEntry));
+    }
   }
 
   async inspectRunLock() {

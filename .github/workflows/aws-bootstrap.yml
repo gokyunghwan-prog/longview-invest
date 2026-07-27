@@ -1,0 +1,124 @@
+name: Bootstrap Longview AWS data
+
+on:
+  workflow_dispatch:
+    inputs:
+      operation:
+        description: Safe bootstrap operation
+        required: true
+        type: choice
+        options:
+          - inspect-state
+          - seed-secrets
+          - migrate-state
+      confirmation:
+        description: Use SEED_AWS_SECRETS or MIGRATE_GITHUB_STATE_TO_AWS for writes
+        required: false
+        type: string
+
+permissions:
+  actions: write
+  contents: read
+  id-token: write
+
+concurrency:
+  group: longview-aws-maintenance
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: ap-northeast-2
+  STACK_NAME: ${{ vars.AWS_STACK_NAME || 'longview-autotrade' }}
+
+jobs:
+  bootstrap:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: aws-production
+
+    steps:
+      - name: Require main, the exact stack, and the protected bootstrap role
+        shell: bash
+        env:
+          BOOTSTRAP_ROLE: ${{ vars.AWS_BOOTSTRAP_ROLE_ARN }}
+        run: |
+          test "$GITHUB_REF" = "refs/heads/main"
+          test "$STACK_NAME" = "longview-autotrade"
+          test -n "$BOOTSTRAP_ROLE"
+
+      - name: Check out main without persisted credentials
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: "22"
+          cache: npm
+
+      - name: Install the locked dependencies
+        run: npm ci --ignore-scripts
+
+      - name: Assume the restricted AWS bootstrap role with OIDC
+        uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c # v6.2.3
+        with:
+          aws-region: ${{ env.AWS_REGION }}
+          role-to-assume: ${{ vars.AWS_BOOTSTRAP_ROLE_ARN }}
+          role-session-name: bootstrap-${{ github.run_id }}-${{ github.run_attempt }}
+
+      - name: Read non-secret resource names
+        id: stack
+        shell: bash
+        run: |
+          state_table="$(aws cloudformation describe-stacks \
+            --stack-name "$STACK_NAME" \
+            --query "Stacks[0].Outputs[?OutputKey=='StateTableName'].OutputValue" \
+            --output text)"
+          kis_secret="$(aws cloudformation describe-stacks \
+            --stack-name "$STACK_NAME" \
+            --query "Stacks[0].Outputs[?OutputKey=='KisSecretArn'].OutputValue" \
+            --output text)"
+          data_secret="$(aws cloudformation describe-stacks \
+            --stack-name "$STACK_NAME" \
+            --query "Stacks[0].Outputs[?OutputKey=='MarketDataSecretArn'].OutputValue" \
+            --output text)"
+          test -n "$state_table"
+          test -n "$kis_secret"
+          test -n "$data_secret"
+          echo "state_table=$state_table" >> "$GITHUB_OUTPUT"
+          echo "kis_secret=$kis_secret" >> "$GITHUB_OUTPUT"
+          echo "data_secret=$data_secret" >> "$GITHUB_OUTPUT"
+
+      - name: Seed encrypted AWS runtime secrets
+        if: inputs.operation == 'seed-secrets'
+        env:
+          AUTOTRADE_KIS_SECRET_ARN: ${{ steps.stack.outputs.kis_secret }}
+          AUTOTRADE_DATA_SECRET_ARN: ${{ steps.stack.outputs.data_secret }}
+          AWS_BOOTSTRAP_CONFIRM: ${{ inputs.confirmation }}
+          KIS_APP_KEY: ${{ secrets.KIS_APP_KEY }}
+          KIS_APP_SECRET: ${{ secrets.KIS_APP_SECRET }}
+          KIS_ACCOUNT_NUMBER: ${{ secrets.KIS_ACCOUNT_NUMBER }}
+          KIS_ACCOUNT_PRODUCT_CODE: ${{ secrets.KIS_ACCOUNT_PRODUCT_CODE }}
+          KIS_HTS_ID: ${{ secrets.KIS_HTS_ID }}
+          DART_API_KEY: ${{ secrets.DART_API_KEY }}
+          DATA_GO_KR_API_KEY: ${{ secrets.DATA_GO_KR_API_KEY }}
+        run: node scripts/aws-bootstrap.mjs seed-secrets
+
+      - name: Inspect encrypted source and AWS target state
+        if: inputs.operation == 'inspect-state'
+        env:
+          AUTOTRADE_STATE_TABLE: ${{ steps.stack.outputs.state_table }}
+          AUTOTRADE_STATE_KEY: ${{ secrets.AUTOTRADE_STATE_KEY }}
+          GITHUB_TOKEN: ${{ github.token }}
+        run: node scripts/aws-bootstrap.mjs inspect-state
+
+      - name: Migrate the encrypted GitHub state exactly once
+        if: inputs.operation == 'migrate-state'
+        env:
+          AUTOTRADE_STATE_TABLE: ${{ steps.stack.outputs.state_table }}
+          AUTOTRADE_STATE_KEY: ${{ secrets.AUTOTRADE_STATE_KEY }}
+          AWS_BOOTSTRAP_CONFIRM: ${{ inputs.confirmation }}
+          LEGACY_AUTOTRADE_DISABLED: ${{ vars.AUTOTRADE_LIVE_ENABLED != 'true' && 'true' || 'false' }}
+          GITHUB_TOKEN: ${{ github.token }}
+        run: node scripts/aws-bootstrap.mjs migrate-state

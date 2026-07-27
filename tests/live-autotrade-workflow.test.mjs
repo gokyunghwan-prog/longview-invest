@@ -4,21 +4,13 @@ import test from "node:test";
 
 const workflowUrl = new URL("../.github/workflows/live-autotrade.yml", import.meta.url);
 
-test("live workflow uses retry-safe heartbeats and never schedules manual top-up", async () => {
+test("legacy GitHub live workflow는 예약·주문·비밀 없이 영구 폐기 상태다", async () => {
   const workflow = await readFile(workflowUrl, "utf8");
 
-  assert.match(workflow, /cron: "17,47 \* \* \* 1-5"/);
-  assert.match(workflow, /cron: "13 6 \* \* 1-5"/);
-  assert.match(workflow, /TRADING_AUTODEPLOY_CASH: "true"/);
-  assert.match(workflow, /run: node scripts\/cloud-autotrade\.mjs auto/);
-  assert.match(workflow, /CLOUD_EVENT_SCHEDULE: "17,47 \* \* \* 1-5"/);
+  assert.match(workflow, /Retired GitHub live autotrade/);
+  assert.match(workflow, /workflow_dispatch:/);
+  assert.match(workflow, /contents: read/);
   assert.match(workflow, /cancel-in-progress: false/);
-
-  const scheduledTopUp = [
-    ...workflow.matchAll(
-      /if: github\.event_name == 'schedule'[^\n]*\n\s+run: node scripts\/cloud-autotrade\.mjs ([^\s]+)/g
-    )
-  ].map((match) => match[1]);
-  assert.ok(!scheduledTopUp.includes("topup"));
-  assert.ok(!scheduledTopUp.includes("topup-plan"));
+  assert.doesNotMatch(workflow, /schedule:/);
+  assert.doesNotMatch(workflow, /cloud-autotrade|KIS_|AUTOTRADE_STATE_KEY|secrets\./);
 });

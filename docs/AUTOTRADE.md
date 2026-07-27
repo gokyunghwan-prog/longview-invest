@@ -1,116 +1,130 @@
 # Longview 국내 자동투자 운영 안내
 
-이 문서는 현재 구현된 구조의 기준 문서입니다. 자동매매는 한국투자증권(KIS) 국내주식 전용이며 미국주식은 포함하지 않습니다.
+자동매매는 한국투자증권(KIS) 국내주식 전용이며 미국주식은 포함하지 않습니다.
+GitHub의 과거 실전 주문 workflow는 영구 폐기된 stub입니다. 새 실전 경로는
+AWS에서만 동작하며, 최초 배포와 전환은
+[AWS 자동투자 runbook](./AWS_AUTOTRADE_RUNBOOK.md)을 순서대로 통과해야 합니다.
+
+AWS 스택을 만드는 것만으로 주문이 시작되지는 않습니다. 기본값은 schedule off,
+dry-run, 영구 kill switch on입니다. 실제 주문은 3~5영업일 dry-run과 상태 이전,
+실잔고 대조가 끝난 뒤 CloudFormation과 SSM의 독립 잠금을 모두 명시적으로
+열어야만 가능합니다.
 
 ## 한눈에 보는 구조
 
 ```text
-매일 19:35·22:35·다음 날 01:35 KST
-GitHub Actions가 DART·금융위원회 데이터 갱신을 재시도
-  → data/companies.json
-  → 같은 판단 기준으로 data/trading-selection.json 생성
+매일 저녁
+EventBridge Scheduler
+  → Step Functions
+  → 일회성 ECS Fargate가 DART·금융위원회 데이터 수집
+  → 검증된 companies + trading-selection을 같은 S3 revision으로 게시
+  → CloudFront manifest가 마지막에 교체됨
 
-평일 30분 간격
-GitHub Actions heartbeat가 신뢰 시간을 확인
-  → 09:05~14:50 KST 밖이면 계좌 접근 없이 종료
-  → 장중이면 그날 하나의 멱등 사이클로 KIS 실전계좌 리밸런싱
+평일 장중
+EventBridge Scheduler
+  → Step Functions
+  → 일회성 ECS Fargate가 같은 trading-selection을 읽음
+  → DynamoDB 원장·lease·주문 intent 확인
+  → KIS 실잔고·당일 시세·매수가능수량 재확인
+  → 조건을 모두 통과한 경우에만 제한 주문
 
-평일 15:13 KST
-주문·체결을 다시 대조하고, 안전하게 확인된 전량 미체결 주문만 취소
-
-로컬 웹사이트
-GitHub의 두 공개 파일을 함께 받아 최신 순위와 자동투자 목표를 표시
+장 마감 뒤
+서로 분리된 reconcile과 audit 실행
+  → 미체결 취소·체결 대조·중복 실행·누락 여부 확인
+  → 실패는 CloudWatch/SNS/DLQ로 알림
 ```
 
-따라서 PC가 꺼져 있어도 데이터와 목표 순위, 자동매매 작업은 GitHub에서 진행됩니다. 다만 `127.0.0.1` 웹사이트 자체는 로컬 서버이므로 화면을 볼 때는 PC에서 `npm.cmd start`를 실행해야 합니다.
+PC가 꺼져 있어도 AWS 수집·판단·주문 대조는 계속됩니다. `127.0.0.1` 웹사이트는
+로컬 화면이므로 볼 때만 PC에서 `npm.cmd start`를 실행합니다. 서버는
+`REMOTE_ARTIFACT_MANIFEST_URL`에 지정된 CloudFront manifest를 받아 AWS 거래기와
+동일한 revision과 checksum의 순위를 표시합니다.
 
 ## 웹사이트와 실제 투자 기준
 
-웹의 기본 정렬인 `자동투자 선정순`과 자동매매는 같은 `trading-selection.json`의 검증된 전체 순위를 사용합니다. 웹에는 100만원 기준 예시 포트폴리오를 표시하고, 실제 주문은 같은 순위 안에서 전용계좌의 현재 자금으로 살 수 있는 상위 종목을 다시 계산합니다.
+웹의 `자동투자 선정순`과 자동매매는 같은 검증된 `trading-selection.json`을
+사용합니다. 웹의 예시 포트폴리오는 100만원 기준이고, 실제 주문은 같은 순위에서
+전용계좌의 현재 현금과 보유주식으로 정수 수량을 다시 계산합니다.
 
 - 국내 KOSPI·KOSDAQ만 사용
-- 웹 공개 예시 투자금 1,000,000원
 - 기본 3종목, 정책 허용 범위 3~5종목
 - 종목당 최대 35%, 업종당 최대 35%
 - 목표 현금 비중 0%
 - 최소 포지션 20,000원, 최소 주문 5,000원
-- 종합점수 78, 신뢰도 85, 완전성 85, 가치평가 신뢰도 75 이상
-- 시가총액 1,000억원, 최근 일 거래대금 5억원 이상
-- 현재 가치가 상대적으로 낮고 장기 성장·품질·재무안전성이 함께 확인되는 회사를 우선
+- 가치평가·장기성장·기업품질·재무안전과 데이터 신뢰도를 함께 확인
+- 적자, 현금흐름 악화, 과도한 부채, 거래정지 같은 가치함정·주문 위험 제외
 
-목표 현금은 0%지만 국내주식은 1주 단위이고 수수료·종목/업종 상한이 있으므로 몇 천~몇 만원의 잔액이 불가피하게 남을 수 있습니다. 미수나 신용으로 억지로 전액을 맞추지 않습니다.
+목표 현금은 0%지만 주식은 1주 단위이며 수수료·종목/업종 상한이 있습니다.
+따라서 더는 안전하게 1주를 살 수 없는 소액은 남을 수 있습니다. 미수·신용이나
+당일 미확정 매도대금으로 억지로 전액을 맞추지 않습니다.
 
 ## 매매 방식
 
-- 최초 배치는 허용 투자금의 최대 100%까지 사용합니다.
-- 현재 실전 워크플로는 자동매매 전용계좌의 전체 관리자산을 기준으로 하며, 평가이익과 매매 후 현금도 다음 리밸런싱에 다시 포함합니다.
-- 이후 기존 보유종목의 매도·교체는 하루 최대 회전율 20%를 유지합니다.
-- 전용계좌에 나중에 입금된 시작 시점 가용현금은 매도 회전율과 분리해, 목표 종목·종목 수·비중·최소 주문 안전규칙 안에서 자동 배치합니다.
-- 당일 예상 매도대금은 같은 실행의 매수 재원으로 미리 사용하지 않습니다.
-- 공개 목표가 바뀌지 않고 비중 이탈이 작으면 그대로 보유합니다.
-- 목표에서 빠진 종목은 두 번 연속 확인한 뒤 정리합니다.
-- 현재가가 당일 KIS 영업일과 일치하지 않으면 주문하지 않습니다.
-- 실전 주문은 평일 09:05~14:50 KST에만 허용합니다.
-- 거래시간은 GitHub 러너의 시스템 시각이 아니라 GitHub API의 HTTPS `Date`를 보수적인 범위로 검증하며, 시각 확인 실패·지연·불일치 시 주문 없이 중단합니다.
-- 매수 직전에 KIS의 `미수 없는 매수가능수량`을 다시 확인합니다.
-- 시장가가 아닌 보수적 지정가만 사용합니다.
-- 수익률 몇 % 도달 시 무조건 매도하는 단기 익절 규칙은 사용하지 않습니다. 가치·장기 순위와 목표비중 변화로만 조정합니다.
-- 수동 `topup`은 비상·진단용으로만 남아 있으며 예약 실행하지 않습니다. 정기 heartbeat의 일반 거래 계획이 추가 현금을 자동 감지하므로 별도 지시가 필요하지 않습니다.
+- 최초 배치는 안전 한도 안에서 가용현금을 최대한 사용합니다.
+- 전용계좌에 나중에 입금된 현금도 다음 정상 일일 사이클에서 자동 감지합니다.
+- 기존 보유종목의 매도·교체는 하루 최대 회전율 20%를 지킵니다.
+- 목표가 같고 비중 이탈이 작으면 거래하지 않고 장기 보유합니다.
+- 목표에서 빠진 종목은 서로 다른 두 번의 확인 뒤에만 정리합니다.
+- 현재가가 KIS가 확인한 당일 영업일과 맞지 않으면 주문하지 않습니다.
+- 매수 직전 `미수 없는 매수가능수량`과 kill switch를 다시 확인합니다.
+- 시장가가 아닌 제한된 지정가만 사용합니다.
+- 수익률 몇 %에 기계적으로 전량 매도하는 단기 익절 규칙은 사용하지 않습니다.
+
+예약 auto는 평일 09:10부터 14:40까지 30분 간격으로 복구 기회를 갖지만, 같은
+KST 날짜의 첫 정상 완료 뒤에는 DynamoDB 멱등 기록으로 나머지가 주문 없이
+끝납니다. KIS 휴장일 API가 거래 불가를 반환하거나 응답을 검증할 수 없으면
+주문하지 않습니다.
 
 ## 중복 주문 방지와 상태 보관
 
-GitHub 러너는 실행할 때마다 사라지므로 상태를 일반 파일이나 Actions 캐시에 두지 않습니다.
-
-- 별도 `trade-state` 브랜치의 `state.enc`에 AES-256-GCM으로 암호화해 저장
-- GitHub blob SHA 비교(CAS), 원격 lease와 fence로 동시 실행 차단
-- 주문 의도를 외부 주문 전에 먼저 저장
+- DynamoDB version CAS와 checksum으로 원장 덮어쓰기를 차단
+- lease, heartbeat, fencing token으로 동시 실행 차단
+- 외부 주문 POST 전에 주문 intent와 현재 원장 version 확인
 - 각 주문 결과를 다음 주문 전에 다시 저장
-- 결과가 불명확하면 재주문하지 않고 `unknown`으로 차단
-- KIS 주문내역을 최대 7일 범위에서 대조
-- 장 마감 후 서로 다른 두 번의 확인에도 주문이 없을 때만 `not_found` 처리
+- 응답이 불명확하면 자동 재주문하지 않고 `unknown`으로 동결
+- KIS 주문내역과 실잔고로만 미결 상태 해소
+- 장 마감 후 서로 다른 조회에서 모두 사라진 주문만 보수적으로 종료
+- 같은 날짜·명령의 완료 journal로 Scheduler 중복 호출 차단
 
-공개 저장소에는 암호문만 올라갑니다. 계좌 잔고, 보유수량, 주문번호, API 키는 공개 순위 파일에 들어갈 수 없도록 검증합니다.
+S3는 검증된 불변 revision을 먼저 쓰고 `latest/manifest.json`을 마지막에
+바꿉니다. 웹사이트와 거래기는 manifest의 byte 수·SHA-256·source revision이
+모두 맞아야 새 자료를 사용합니다.
 
-## GitHub에 필요한 비밀값
+## 비밀값과 전환 상태
 
-저장소의 `Settings → Secrets and variables → Actions`에 아래 값을 등록합니다.
+KIS와 시장데이터 자격정보의 운영 저장소는 AWS Secrets Manager입니다.
+Task definition, S3, DynamoDB, 공개 순위와 로그에는 실제 값을 넣지 않습니다.
+GitHub의 기존 암호화 Secret은 최초 AWS seed와 legacy 상태 이전에만 사용하고,
+전환 뒤 삭제 또는 회전합니다. 장기 AWS access key는 GitHub에 만들지 않으며
+GitHub Actions는 보호 environment의 OIDC 단기 자격증명만 사용합니다.
 
-- `DART_API_KEY`
-- `DATA_GO_KR_API_KEY`
-- `KIS_APP_KEY`
-- `KIS_APP_SECRET`
-- `KIS_ACCOUNT_NUMBER`
-- `KIS_ACCOUNT_PRODUCT_CODE` (보통 `01`)
-- `KIS_HTS_ID` (선택)
-- `AUTOTRADE_STATE_KEY` (정확히 32바이트인 표준 Base64 키)
-- `LIVE_TRADING_ACK=I_UNDERSTAND_LIVE_TRADING_RISK`
-- `USE_ALL_DEDICATED_ACCOUNT_ASSETS_ACK=I_ACCEPT_USING_ALL_DEDICATED_ACCOUNT_ASSETS`
-- `UNATTENDED_LIVE_TRADING_ACK=I_ACCEPT_UNATTENDED_LIVE_TRADING_RISK`
-- `CLOUD_LIVE_TRADING_ACK=I_ACCEPT_GITHUB_ACTIONS_LIVE_TRADING`
+기존 GitHub 실전 writer가 다시 켜지지 않도록
+`AUTOTRADE_LIVE_ENABLED=false`를 유지합니다. AWS와 GitHub 주문 실행기를 동시에
+사용하면 안 됩니다.
 
-API 키와 계좌번호는 커밋하지 않습니다. 로컬 `.env`와 GitHub Actions 암호화 Secrets에만 둡니다.
+## 최초 활성화
 
-실전 워크플로의 `TRADING_CAPITAL_LIMIT_KRW=0`은 무제한 신용을 뜻하지 않습니다. 미수·신용은 사용하지 않고, KIS가 확인한 전용계좌의 실제 현금과 이 시스템이 관리하는 보유주식만 전부 다시 배분한다는 뜻입니다. 이 모드는 `TRADING_REQUIRE_DEDICATED_ACCOUNT=true`, `TRADING_USE_ALL_DEDICATED_ACCOUNT_ASSETS=true`, 위 전체자산 승인문구가 모두 정확히 일치할 때만 시작됩니다. 원화 상한을 두고 싶으면 `TRADING_CAPITAL_LIMIT_KRW`를 양수로 설정할 수 있습니다.
+임의로 일부 단계만 실행하지 말고
+[AWS 자동투자 최초 배포·전환 runbook](./AWS_AUTOTRADE_RUNBOOK.md)의 확인란을
+사용합니다. 큰 흐름은 다음과 같습니다.
 
-저장소 변수에는 다음 값이 있습니다.
-
-- `AUTOTRADE_LIVE_ENABLED=false`: 기본값, 예약 실전매매 중지
-- `AUTOTRADE_LIVE_ENABLED=true`: 검증 완료 뒤 예약 실전매매 허용
-
-## 처음 활성화하는 순서
-
-1. 코드를 기본 브랜치에 반영합니다.
-2. 위 Secrets를 등록하고 `AUTOTRADE_LIVE_ENABLED=false`로 둡니다.
-3. `Actions → Encrypted Korean live autotrade → Run workflow`에서 기본값 `plan`, `confirm_live=false`로 실행합니다.
-4. 로그에서 테스트·공개선정·KIS 읽기전용 계획이 정상인지 확인합니다. 이 단계는 주문하지 않습니다.
-5. 별도 KIS 앱에서 계좌가 자동투자 전용이며 다른 보유주식이 없는지 확인합니다. 전체자산 모드에서는 이후 이 계좌에 추가한 현금과 발생한 수익도 자동투자 대상이 됩니다.
-6. 마지막으로 저장소 변수만 `AUTOTRADE_LIVE_ENABLED=true`로 바꿉니다.
-
-GitHub 예약 실행은 정확한 시각을 보장하지 않고 혼잡하면 늦거나 누락될 수 있습니다. 그래서 정각을 피한 17분·47분 heartbeat를 두고, 코드가 주문시간·당일 시세·상태 SHA를 다시 검사합니다. 장외 실행은 계좌에 접근하지 않고 닫히며, 같은 날 여러 실행이 장중에 도착해도 안정적인 일일 사이클 키 때문에 첫 완료 이후 주문하지 않습니다.
+1. AWS 계정 MFA·Budget 준비
+2. 정확한 `longview-autotrade` 안전 기본 스택 생성
+3. GitHub `aws-production` 보호 environment와 역할 변수 설정
+4. 컨테이너 배포와 Secrets Manager seed
+5. 데이터 sync·checksum·CloudFront 검증
+6. 기존 주문 writer 중지·drain과 원장 이전
+7. 3~5영업일 AWS dry-run
+8. legacy 데이터 sync 중지와 웹 manifest 전환
+9. 실잔고 최종 대조 뒤 live 이중 잠금 해제
 
 ## 즉시 중지
 
-가장 빠른 방법은 GitHub 저장소의 `AUTOTRADE_LIVE_ENABLED` 변수를 `false`로 바꾸고, 실행 중인 Actions 작업이 있으면 `Cancel workflow`를 누르는 것입니다. 이미 증권사에 접수된 주문은 KIS 앱에서 직접 확인해야 합니다.
+1. AWS Systems Manager Parameter Store의 제어 JSON에서
+   `killSwitch=true`를 가장 먼저 적용합니다.
+2. CloudFormation의 `EnableTradingSchedule=false`로 예약 실행을 끕니다.
+3. 실행 중인 Step Functions/ECS 작업과 KIS 미체결 주문을 확인합니다.
+4. KIS 앱에서 이미 접수된 주문을 직접 대조합니다.
+5. 원인을 해결하고 실잔고·DynamoDB 원장이 일치하기 전에는 잠금을 풀지 않습니다.
 
 ## 로컬 확인 명령
 
@@ -122,9 +136,14 @@ npm.cmd start
 ```
 
 - 웹사이트: <http://127.0.0.1:4173>
-- `trade:verify-kis`는 인증과 잔고 조회만 하며 주문은 0건입니다.
-- 로컬 `.env`는 계속 `paper`로 두어도 GitHub 실전 워크플로에는 영향이 없습니다.
+- `trade:verify-kis`는 인증과 잔고 조회만 하며 주문은 보내지 않습니다.
+- 로컬 `.env`는 계속 `paper`로 둘 수 있습니다.
+- AWS 운영 상태는 CloudWatch, Step Functions, DynamoDB journal과 KIS 앱을 함께
+  확인합니다.
 
 ## 중요 한계
 
-이 시스템은 수익을 보장하지 않습니다. 공시·재무·시세 지연, API 장애, 거래정지, 상하한가, 수수료와 세금, 슬리피지로 실제 결과가 달라질 수 있습니다. 자동화는 판단과 주문을 반복할 뿐 미래 가격을 알 수 없습니다.
+이 시스템은 수익이나 무중단 주문을 보장하지 않습니다. 공시·일일 시세 지연,
+증권사/API 점검, 거래정지, 상하한가, 부분체결, 수수료·세금과 슬리피지로 결과가
+달라집니다. 데이터 또는 주문 결과를 확실히 확인할 수 없을 때는 거래를
+추정하지 않고 실패 폐쇄하며, 알림을 받은 운영자의 확인이 필요합니다.

@@ -1,0 +1,134 @@
+name: Deploy Longview AWS runtime
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - "autotrade/**"
+      - "lib/**"
+      - "scripts/**"
+      - "server.mjs"
+      - "package.json"
+      - "package-lock.json"
+      - "Dockerfile"
+      - ".dockerignore"
+      - "infra/aws/**"
+      - ".github/workflows/aws-deploy.yml"
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: longview-aws-maintenance
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: ap-northeast-2
+  STACK_NAME: ${{ vars.AWS_STACK_NAME || 'longview-autotrade' }}
+
+jobs:
+  deploy:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (vars.AWS_DEPLOY_ROLE_ARN != '' && vars.AWS_CLOUDFORMATION_ROLE_ARN != '')
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    environment: aws-production
+
+    steps:
+      - name: Require the exact AWS stack and protected role variables
+        shell: bash
+        env:
+          DEPLOY_ROLE: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          CLOUDFORMATION_ROLE: ${{ vars.AWS_CLOUDFORMATION_ROLE_ARN }}
+        run: |
+          test "$GITHUB_REF" = "refs/heads/main"
+          test "$STACK_NAME" = "longview-autotrade"
+          test -n "$DEPLOY_ROLE"
+          test -n "$CLOUDFORMATION_ROLE"
+
+      - name: Check out the exact revision
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: "22"
+          cache: npm
+
+      - name: Verify the exact source before publishing an image
+        run: |
+          npm ci --ignore-scripts
+          npm run check
+
+      - name: Assume the repository-scoped AWS role with OIDC
+        uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c # v6.2.3
+        with:
+          aws-region: ${{ env.AWS_REGION }}
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          role-session-name: github-${{ github.run_id }}-${{ github.run_attempt }}
+
+      - name: Read non-secret deployment outputs
+        id: stack
+        shell: bash
+        run: |
+          ecr_uri="$(aws cloudformation describe-stacks \
+            --stack-name "$STACK_NAME" \
+            --query "Stacks[0].Outputs[?OutputKey=='EcrRepositoryUri'].OutputValue" \
+            --output text)"
+          ecr_name="$(aws cloudformation describe-stacks \
+            --stack-name "$STACK_NAME" \
+            --query "Stacks[0].Outputs[?OutputKey=='EcrRepositoryName'].OutputValue" \
+            --output text)"
+          deployment_bucket="$(aws cloudformation describe-stacks \
+            --stack-name "$STACK_NAME" \
+            --query "Stacks[0].Outputs[?OutputKey=='SnapshotBucketName'].OutputValue" \
+            --output text)"
+          test -n "$ecr_uri"
+          test -n "$ecr_name"
+          test -n "$deployment_bucket"
+          echo "ecr_uri=$ecr_uri" >> "$GITHUB_OUTPUT"
+          echo "ecr_name=$ecr_name" >> "$GITHUB_OUTPUT"
+          echo "deployment_bucket=$deployment_bucket" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to the stack ECR repository
+        shell: bash
+        run: |
+          registry="${{ steps.stack.outputs.ecr_uri }}"
+          registry="${registry%%/*}"
+          aws ecr get-login-password --region "$AWS_REGION" |
+            docker login --username AWS --password-stdin "$registry"
+
+      - name: Build and push one immutable commit image
+        shell: bash
+        run: |
+          if aws ecr describe-images \
+            --repository-name "${{ steps.stack.outputs.ecr_name }}" \
+            --image-ids "imageTag=$GITHUB_SHA" > /dev/null 2>&1; then
+            echo "Image for this commit already exists; reusing it."
+          else
+            docker build --pull \
+              --tag "${{ steps.stack.outputs.ecr_uri }}:$GITHUB_SHA" .
+            docker push "${{ steps.stack.outputs.ecr_uri }}:$GITHUB_SHA"
+          fi
+
+      - name: Update code without changing safety parameters
+        shell: bash
+        run: |
+          aws cloudformation deploy \
+            --region "$AWS_REGION" \
+            --stack-name "$STACK_NAME" \
+            --template-file infra/aws/template.yaml \
+            --s3-bucket "${{ steps.stack.outputs.deployment_bucket }}" \
+            --s3-prefix deployment/cloudformation \
+            --role-arn "${{ vars.AWS_CLOUDFORMATION_ROLE_ARN }}" \
+            --capabilities CAPABILITY_NAMED_IAM \
+            --parameter-overrides \
+              "ContainerImageTag=$GITHUB_SHA" \
+              "GitHubRepository=$GITHUB_REPOSITORY" \
+            --no-fail-on-empty-changeset

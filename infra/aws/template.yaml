@@ -1,0 +1,2199 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  Longview domestic autotrade runtime: EventBridge Scheduler, Step Functions
+  Standard, ECS Fargate, DynamoDB, S3, Secrets Manager, CloudWatch, SNS, SQS,
+  and GitHub OIDC. Schedules and live trading are disabled by default.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: Deployment
+        Parameters:
+          - ProjectName
+          - EnvironmentName
+          - ContainerImageTag
+      - Label:
+          default: Trading safety
+        Parameters:
+          - ExecutionMode
+          - EnableTradingSchedule
+          - EnableDataSyncSchedule
+          - LiveTradingAcknowledgement
+      - Label:
+          default: GitHub OIDC
+        Parameters:
+          - GitHubRepository
+          - GitHubDeployEnvironment
+          - CreateGitHubOidcProvider
+          - ExistingGitHubOidcProviderArn
+      - Label:
+          default: Operations
+        Parameters:
+          - AlertEmail
+          - LogRetentionDays
+    ParameterLabels:
+      ExecutionMode:
+        default: Execution mode (dry-run is the safe default)
+      EnableTradingSchedule:
+        default: Enable automatic trade/reconcile/audit schedules
+      EnableDataSyncSchedule:
+        default: Enable automatic market-data schedules
+      LiveTradingAcknowledgement:
+        default: Explicit live-trading acknowledgement
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: longview
+    AllowedPattern: "^[a-z][a-z0-9-]{1,19}$"
+    ConstraintDescription: Use 2-20 lowercase letters, digits, and hyphens.
+
+  EnvironmentName:
+    Type: String
+    Default: prod
+    AllowedPattern: "^[a-z][a-z0-9-]{1,11}$"
+    ConstraintDescription: Use 2-12 lowercase letters, digits, and hyphens.
+
+  ContainerImageTag:
+    Type: String
+    Default: bootstrap
+    AllowedPattern: "^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$"
+    Description: >-
+      Immutable ECR image tag. GitHub deployments should set this to the commit
+      SHA. The bootstrap tag does not have to exist while schedules are disabled.
+
+  ExecutionMode:
+    Type: String
+    Default: dry-run
+    AllowedValues:
+      - dry-run
+      - live
+    Description: The task remains incapable of live ordering in dry-run mode.
+
+  EnableTradingSchedule:
+    Type: String
+    Default: "false"
+    AllowedValues:
+      - "false"
+      - "true"
+    Description: >-
+      Enables the daily trade decision, reconciliation, and absence audits.
+      Leave false through all dry-run and fault-injection tests.
+
+  EnableDataSyncSchedule:
+    Type: String
+    Default: "false"
+    AllowedValues:
+      - "false"
+      - "true"
+    Description: Enables the two idempotent daily data-refresh attempts.
+
+  LiveTradingAcknowledgement:
+    Type: String
+    Default: ""
+    AllowedPattern: "^$|^I_ACKNOWLEDGE_LIVE_TRADING$"
+    Description: >-
+      Must exactly equal I_ACKNOWLEDGE_LIVE_TRADING before ExecutionMode can be
+      live. This is not a credential.
+
+  GitHubRepository:
+    Type: String
+    Default: gokyunghwan-prog/longview-invest
+    AllowedPattern: "^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$"
+    Description: GitHub owner/repository allowed to assume the deployment role.
+
+  GitHubDeployEnvironment:
+    Type: String
+    Default: aws-production
+    AllowedPattern: "^[A-Za-z0-9_.-]+$"
+    Description: >-
+      Only jobs using this protected GitHub environment can assume deployment
+      and bootstrap roles.
+
+  CreateGitHubOidcProvider:
+    Type: String
+    Default: "true"
+    AllowedValues:
+      - "false"
+      - "true"
+    Description: >-
+      Set false if token.actions.githubusercontent.com is already registered in
+      this AWS account.
+
+  ExistingGitHubOidcProviderArn:
+    Type: String
+    Default: ""
+    AllowedPattern: "^$|^arn:[A-Za-z0-9-]+:iam::[0-9]{12}:oidc-provider/token\\.actions\\.githubusercontent\\.com$"
+    Description: Required only when CreateGitHubOidcProvider is false.
+
+  AlertEmail:
+    Type: String
+    Default: ""
+    AllowedPattern: "^$|^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$"
+    Description: Optional SNS email recipient. AWS sends a confirmation email.
+
+  LogRetentionDays:
+    Type: Number
+    Default: 30
+    AllowedValues:
+      - 7
+      - 14
+      - 30
+      - 60
+      - 90
+
+Rules:
+  ExistingOidcProviderIsSupplied:
+    RuleCondition: !Equals [!Ref CreateGitHubOidcProvider, "false"]
+    Assertions:
+      - Assert: !Not [!Equals [!Ref ExistingGitHubOidcProviderArn, ""]]
+        AssertDescription: >-
+          ExistingGitHubOidcProviderArn is required when the stack does not
+          create the GitHub OIDC provider.
+
+  LiveModeRequiresExplicitAcknowledgement:
+    RuleCondition: !Equals [!Ref ExecutionMode, live]
+    Assertions:
+      - Assert: !Equals
+          - !Ref LiveTradingAcknowledgement
+          - I_ACKNOWLEDGE_LIVE_TRADING
+        AssertDescription: >-
+          Live mode requires the exact I_ACKNOWLEDGE_LIVE_TRADING value.
+
+Conditions:
+  CreateGitHubOidcProviderCondition: !Equals
+    - !Ref CreateGitHubOidcProvider
+    - "true"
+  HasAlertEmail: !Not
+    - !Equals
+      - !Ref AlertEmail
+      - ""
+  LiveMode: !Equals
+    - !Ref ExecutionMode
+    - live
+  TradingScheduleEnabled: !Equals
+    - !Ref EnableTradingSchedule
+    - "true"
+  DataSyncScheduleEnabled: !Equals
+    - !Ref EnableDataSyncSchedule
+    - "true"
+
+Resources:
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.42.0.0/24
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      InstanceTenancy: default
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-${EnvironmentName}-autotrade
+        - Key: Project
+          Value: !Ref ProjectName
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-${EnvironmentName}-autotrade
+
+  VpcGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      InternetGatewayId: !Ref InternetGateway
+      VpcId: !Ref Vpc
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-${EnvironmentName}-public
+
+  PublicDefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: VpcGatewayAttachment
+    Properties:
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+      RouteTableId: !Ref PublicRouteTable
+
+  PublicSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      AvailabilityZone: !Select
+        - 0
+        - !GetAZs ""
+      CidrBlock: 10.42.0.0/26
+      MapPublicIpOnLaunch: true
+      VpcId: !Ref Vpc
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-${EnvironmentName}-public-a
+
+  PublicSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      AvailabilityZone: !Select
+        - 1
+        - !GetAZs ""
+      CidrBlock: 10.42.0.64/26
+      MapPublicIpOnLaunch: true
+      VpcId: !Ref Vpc
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-${EnvironmentName}-public-b
+
+  PublicSubnetARouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref PublicSubnetA
+
+  PublicSubnetBRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref PublicSubnetB
+
+  TaskSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Outbound-only HTTPS and KIS Open API access
+      SecurityGroupEgress:
+        - Description: Standard HTTPS APIs and AWS public service endpoints
+          IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+        - Description: Korea Investment Open API TLS endpoint
+          IpProtocol: tcp
+          FromPort: 9443
+          ToPort: 9443
+          CidrIp: 0.0.0.0/0
+      VpcId: !Ref Vpc
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-${EnvironmentName}-task
+
+  SnapshotBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      LifecycleConfiguration:
+        Rules:
+          - Id: clean-old-noncurrent-snapshot-versions
+            Status: Enabled
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 90
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+          - Id: expire-deployment-template-artifacts
+            Status: Enabled
+            Prefix: deployment/
+            ExpirationInDays: 30
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: DataClass
+          Value: immutable-market-snapshots
+
+  SnapshotBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref SnapshotBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: s3:*
+            Resource:
+              - !GetAtt SnapshotBucket.Arn
+              - !Sub ${SnapshotBucket.Arn}/*
+            Condition:
+              Bool:
+                aws:SecureTransport: "false"
+          - Sid: AllowCloudFrontReadOnlyPublicArtifacts
+            Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action:
+              - s3:GetObject
+            Resource:
+              - !Sub ${SnapshotBucket.Arn}/latest/*
+              - !Sub ${SnapshotBucket.Arn}/revisions/*
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub >-
+                  arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:distribution/${SnapshotDistribution}
+
+  SnapshotOriginAccessControl:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Description: !Sub Read-only OAC for ${AWS::StackName} public snapshots
+        Name: !Sub ${ProjectName}-${EnvironmentName}-snapshot-oac
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  LatestManifestCachePolicy:
+    Type: AWS::CloudFront::CachePolicy
+    Properties:
+      CachePolicyConfig:
+        Comment: Short cache for the atomic latest revision pointer
+        DefaultTTL: 30
+        MaxTTL: 60
+        MinTTL: 0
+        Name: !Sub ${ProjectName}-${EnvironmentName}-latest-manifest
+        ParametersInCacheKeyAndForwardedToOrigin:
+          CookiesConfig:
+            CookieBehavior: none
+          EnableAcceptEncodingBrotli: true
+          EnableAcceptEncodingGzip: true
+          HeadersConfig:
+            HeaderBehavior: none
+          QueryStringsConfig:
+            QueryStringBehavior: none
+
+  SnapshotDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        CacheBehaviors:
+          - AllowedMethods:
+              - GET
+              - HEAD
+              - OPTIONS
+            CachePolicyId: !Ref LatestManifestCachePolicy
+            CachedMethods:
+              - GET
+              - HEAD
+              - OPTIONS
+            Compress: true
+            OriginRequestPolicyId: 88a5eaf4-2fd4-4709-b370-b4c650ea3fcf
+            PathPattern: latest/manifest.json
+            ResponseHeadersPolicyId: 5cc3b908-e619-4b99-88e5-2cf7f45965bd
+            TargetOriginId: snapshot-bucket
+            ViewerProtocolPolicy: redirect-to-https
+        Comment: !Sub ${AWS::StackName} immutable public market snapshots
+        DefaultCacheBehavior:
+          AllowedMethods:
+            - GET
+            - HEAD
+            - OPTIONS
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6
+          CachedMethods:
+            - GET
+            - HEAD
+            - OPTIONS
+          Compress: true
+          OriginRequestPolicyId: 88a5eaf4-2fd4-4709-b370-b4c650ea3fcf
+          ResponseHeadersPolicyId: 5cc3b908-e619-4b99-88e5-2cf7f45965bd
+          TargetOriginId: snapshot-bucket
+          ViewerProtocolPolicy: redirect-to-https
+        DefaultRootObject: latest/manifest.json
+        Enabled: true
+        HttpVersion: http2and3
+        IPV6Enabled: true
+        Origins:
+          - DomainName: !GetAtt SnapshotBucket.RegionalDomainName
+            Id: snapshot-bucket
+            OriginAccessControlId: !Ref SnapshotOriginAccessControl
+            S3OriginConfig:
+              OriginAccessIdentity: ""
+        PriceClass: PriceClass_200
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  AutotradeStateTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      AttributeDefinitions:
+        - AttributeName: pk
+          AttributeType: S
+      BillingMode: PAY_PER_REQUEST
+      KeySchema:
+        - AttributeName: pk
+          KeyType: HASH
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: DataClass
+          Value: trading-state-lock-idempotency-token
+
+  KisCredentialsSecret:
+    Type: AWS::SecretsManager::Secret
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      Description: >-
+        Empty KIS credential container. Populate a secret version out of band;
+        never pass credentials through CloudFormation or commit them.
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: DataClass
+          Value: confidential-kis-credentials
+
+  MarketDataCredentialsSecret:
+    Type: AWS::SecretsManager::Secret
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      Description: >-
+        Empty market-data credential container for DART_API_KEY and
+        DATA_GO_KR_API_KEY. Populate a secret version out of band.
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: DataClass
+          Value: confidential-market-data-credentials
+
+  KillSwitchParameter:
+    Type: AWS::SSM::Parameter
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      Description: >-
+        Durable live-order kill switch. true blocks all live order submission.
+      Name: !Sub /${ProjectName}/${EnvironmentName}/autotrade/kill-switch
+      Type: String
+      Value: >-
+        {"schemaVersion":1,"killSwitch":true,"liveEnabled":false,"reason":"bootstrap-safe"}
+      Tags:
+        Project: !Ref ProjectName
+
+  ContainerRepository:
+    Type: AWS::ECR::Repository
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      EncryptionConfiguration:
+        EncryptionType: AES256
+      ImageScanningConfiguration:
+        ScanOnPush: true
+      ImageTagMutability: IMMUTABLE
+      LifecyclePolicy:
+        LifecyclePolicyText: |
+          {
+            "rules": [
+              {
+                "rulePriority": 1,
+                "description": "Keep the newest 30 deploy images",
+                "selection": {
+                  "tagStatus": "any",
+                  "countType": "imageCountMoreThan",
+                  "countNumber": 30
+                },
+                "action": {
+                  "type": "expire"
+                }
+              }
+            ]
+          }
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  EcsCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterSettings:
+        - Name: containerInsights
+          Value: disabled
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  TaskLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/ecs/${AWS::StackName}/autotrade
+      RetentionInDays: !Ref LogRetentionDays
+
+  StateMachineLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/vendedlogs/states/${AWS::StackName}
+      RetentionInDays: !Ref LogRetentionDays
+
+  AlertTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      DisplayName: Longview autotrade alerts
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  AlertEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasAlertEmail
+    Properties:
+      Endpoint: !Ref AlertEmail
+      Protocol: email
+      TopicArn: !Ref AlertTopic
+
+  SchedulerDeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      MessageRetentionPeriod: 1209600
+      SqsManagedSseEnabled: true
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  TaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+      ManagedPolicyArns:
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  TradingTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+      Policies:
+        - PolicyName: longview-trading-runtime
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: DurableTradingState
+                Effect: Allow
+                Action:
+                  - dynamodb:DeleteItem
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                Resource: !GetAtt AutotradeStateTable.Arn
+              - Sid: ReadValidatedSnapshots
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                Resource:
+                  - !Sub ${SnapshotBucket.Arn}/latest/*
+                  - !Sub ${SnapshotBucket.Arn}/revisions/*
+              - Sid: ReadKisCredentialsAtRuntime
+                Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource: !Ref KisCredentialsSecret
+              - Sid: ReadDurableKillSwitch
+                Effect: Allow
+                Action:
+                  - ssm:GetParameter
+                Resource: !Sub >-
+                  arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter${KillSwitchParameter}
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  DataSyncTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+      Policies:
+        - PolicyName: longview-data-sync-runtime
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: DurableSyncLeaseAndRevisionState
+                Effect: Allow
+                Action:
+                  - dynamodb:DeleteItem
+                  - dynamodb:GetItem
+                  - dynamodb:UpdateItem
+                Resource: !GetAtt AutotradeStateTable.Arn
+              - Sid: ListSnapshotBucket
+                Effect: Allow
+                Action:
+                  - s3:ListBucket
+                Resource: !GetAtt SnapshotBucket.Arn
+                Condition:
+                  StringLike:
+                    s3:prefix:
+                      - private/sync-checkpoints/dart/*
+                      - latest/manifest.json
+              - Sid: AtomicallyPublishValidatedSnapshots
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                Resource:
+                  - !Sub ${SnapshotBucket.Arn}/latest/*
+                  - !Sub ${SnapshotBucket.Arn}/revisions/*
+              - Sid: PersistPrivateCollectorCheckpoints
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                Resource: !Sub ${SnapshotBucket.Arn}/private/sync-checkpoints/*
+              - Sid: ReadMarketDataCredentialsAtRuntime
+                Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource: !Ref MarketDataCredentialsSecret
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  TradingTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Cpu: "256"
+      ExecutionRoleArn: !GetAtt TaskExecutionRole.Arn
+      Family: !Sub ${ProjectName}-${EnvironmentName}-autotrade
+      Memory: "1024"
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      RuntimePlatform:
+        CpuArchitecture: X86_64
+        OperatingSystemFamily: LINUX
+      TaskRoleArn: !GetAtt TradingTaskRole.Arn
+      ContainerDefinitions:
+        - Name: longview-autotrade
+          Image: !Sub ${ContainerRepository.RepositoryUri}:${ContainerImageTag}
+          Essential: true
+          Command:
+            - node
+            - scripts/aws-task.mjs
+            - audit
+          Environment:
+            - Name: AUTOTRADE_CLOUD_PROVIDER
+              Value: aws-fargate
+            - Name: AUTOTRADE_EXECUTION_MODE
+              Value: !Ref ExecutionMode
+            - Name: AUTOTRADE_LIVE_ENABLED
+              Value: !If
+                - LiveMode
+                - "true"
+                - "false"
+            - Name: AUTOTRADE_STATE_TABLE
+              Value: !Ref AutotradeStateTable
+            - Name: AUTOTRADE_SNAPSHOT_BUCKET
+              Value: !Ref SnapshotBucket
+            - Name: AUTOTRADE_KIS_SECRET_ARN
+              Value: !Ref KisCredentialsSecret
+            - Name: AUTOTRADE_KILL_SWITCH_PARAMETER
+              Value: !Ref KillSwitchParameter
+            - Name: AUTOTRADE_FINAL_RECONCILE_SLOT
+              Value: reconcile-final
+            - Name: AUTOTRADE_EXPECTED_SCHEDULE_GROUP
+              Value: !Ref SchedulerGroup
+            - Name: AUTOTRADE_EXPECTED_SCHEDULE_NAME_PREFIX
+              Value: !Sub ${ProjectName}-${EnvironmentName}
+            - Name: AUTOTRADE_AWS_TRADE_LEASE_MS
+              Value: "2700000"
+            - Name: AUTOTRADE_AWS_LEASE_HEARTBEAT_MS
+              Value: "120000"
+            - Name: AUTOTRADE_TASK_DEADLINE_MS
+              Value: "1740000"
+            - Name: AUTOTRADE_TASK_DEADLINE_GUARD_MS
+              Value: "60000"
+            - Name: AUTOTRADE_EXPECTED_TASK_FAMILY
+              Value: !Sub ${ProjectName}-${EnvironmentName}-autotrade
+            - Name: AUTOTRADE_METRIC_NAMESPACE
+              Value: Longview/Autotrade
+            - Name: AUTOTRADE_STACK_NAME
+              Value: !Ref AWS::StackName
+            - Name: AUTOTRADE_ALERT_TOPIC_ARN
+              Value: !Ref AlertTopic
+            - Name: NODE_ENV
+              Value: production
+          LinuxParameters:
+            InitProcessEnabled: true
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref TaskLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: trading
+          StopTimeout: 30
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  DataSyncTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Cpu: "512"
+      ExecutionRoleArn: !GetAtt TaskExecutionRole.Arn
+      Family: !Sub ${ProjectName}-${EnvironmentName}-data-sync
+      Memory: "2048"
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      RuntimePlatform:
+        CpuArchitecture: X86_64
+        OperatingSystemFamily: LINUX
+      TaskRoleArn: !GetAtt DataSyncTaskRole.Arn
+      ContainerDefinitions:
+        - Name: longview-autotrade
+          Image: !Sub ${ContainerRepository.RepositoryUri}:${ContainerImageTag}
+          Essential: true
+          Command:
+            - node
+            - scripts/aws-task.mjs
+            - sync
+          Environment:
+            - Name: AUTOTRADE_CLOUD_PROVIDER
+              Value: aws-fargate
+            - Name: AUTOTRADE_EXECUTION_MODE
+              Value: dry-run
+            - Name: AUTOTRADE_LIVE_ENABLED
+              Value: "false"
+            - Name: AUTOTRADE_STATE_TABLE
+              Value: !Ref AutotradeStateTable
+            - Name: AUTOTRADE_SNAPSHOT_BUCKET
+              Value: !Ref SnapshotBucket
+            - Name: AUTOTRADE_DATA_SECRET_ARN
+              Value: !Ref MarketDataCredentialsSecret
+            - Name: AUTOTRADE_AWS_SYNC_LEASE_MS
+              Value: "8100000"
+            - Name: AUTOTRADE_AWS_LEASE_HEARTBEAT_MS
+              Value: "120000"
+            - Name: AUTOTRADE_TASK_DEADLINE_MS
+              Value: "7140000"
+            - Name: AUTOTRADE_TASK_DEADLINE_GUARD_MS
+              Value: "60000"
+            - Name: AUTOTRADE_EXPECTED_TASK_FAMILY
+              Value: !Sub ${ProjectName}-${EnvironmentName}-data-sync
+            - Name: AUTOTRADE_EXPECTED_SCHEDULE_GROUP
+              Value: !Ref SchedulerGroup
+            - Name: AUTOTRADE_EXPECTED_SCHEDULE_NAME_PREFIX
+              Value: !Sub ${ProjectName}-${EnvironmentName}
+            - Name: AUTOTRADE_METRIC_NAMESPACE
+              Value: Longview/Autotrade
+            - Name: AUTOTRADE_STACK_NAME
+              Value: !Ref AWS::StackName
+            - Name: AUTOTRADE_ALERT_TOPIC_ARN
+              Value: !Ref AlertTopic
+            - Name: NODE_ENV
+              Value: production
+          LinuxParameters:
+            InitProcessEnabled: true
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref TaskLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: data-sync
+          StopTimeout: 30
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  StateMachineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: states.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+      Policies:
+        - PolicyName: run-fargate-task-and-alert
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: RunExactTaskDefinition
+                Effect: Allow
+                Action:
+                  - ecs:RunTask
+                Resource:
+                  - !Ref TradingTaskDefinition
+                  - !Ref DataSyncTaskDefinition
+                Condition:
+                  ArnEquals:
+                    ecs:cluster: !GetAtt EcsCluster.Arn
+              - Sid: ObserveAndStopLaunchedTasks
+                Effect: Allow
+                Action:
+                  - ecs:DescribeTasks
+                  - ecs:StopTask
+                Resource: "*"
+              - Sid: PassOnlyAutotradeTaskRoles
+                Effect: Allow
+                Action:
+                  - iam:PassRole
+                Resource:
+                  - !GetAtt TaskExecutionRole.Arn
+                  - !GetAtt TradingTaskRole.Arn
+                  - !GetAtt DataSyncTaskRole.Arn
+                Condition:
+                  StringEquals:
+                    iam:PassedToService: ecs-tasks.amazonaws.com
+              - Sid: ManageStepFunctionsEcsCompletionRule
+                Effect: Allow
+                Action:
+                  - events:DescribeRule
+                  - events:PutRule
+                  - events:PutTargets
+                Resource: !Sub >-
+                  arn:${AWS::Partition}:events:${AWS::Region}:${AWS::AccountId}:rule/StepFunctionsGetEventsForECSTaskRule
+              - Sid: PublishFailureAlert
+                Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref AlertTopic
+              - Sid: DeliverStateMachineLogs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogDelivery
+                  - logs:DeleteLogDelivery
+                  - logs:DescribeLogGroups
+                  - logs:DescribeResourcePolicies
+                  - logs:GetLogDelivery
+                  - logs:ListLogDeliveries
+                  - logs:PutResourcePolicy
+                  - logs:UpdateLogDelivery
+                Resource: "*"
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  AutotradeStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      DefinitionString: !Sub |
+        {
+          "Comment": "Run one idempotent trade, reconcile, or audit command",
+          "StartAt": "ValidateTradingCommand",
+          "TimeoutSeconds": 2500,
+          "States": {
+            "ValidateTradingCommand": {
+              "Type": "Choice",
+              "Choices": [
+                {
+                  "Variable": "$.command",
+                  "StringEquals": "auto",
+                  "Next": "RunTradingCommand"
+                },
+                {
+                  "Variable": "$.command",
+                  "StringEquals": "reconcile",
+                  "Next": "RunTradingCommand"
+                },
+                {
+                  "Variable": "$.command",
+                  "StringEquals": "audit",
+                  "Next": "RunTradingCommand"
+                }
+              ],
+              "Default": "InvalidCommand"
+            },
+            "RunTradingCommand": {
+              "Type": "Task",
+              "Resource": "arn:${AWS::Partition}:states:::ecs:runTask.sync",
+              "TimeoutSeconds": 2400,
+              "Parameters": {
+                "Cluster": "${EcsCluster}",
+                "TaskDefinition": "${TradingTaskDefinition}",
+                "LaunchType": "FARGATE",
+                "PlatformVersion": "LATEST",
+                "NetworkConfiguration": {
+                  "AwsvpcConfiguration": {
+                    "AssignPublicIp": "ENABLED",
+                    "SecurityGroups": ["${TaskSecurityGroup}"],
+                    "Subnets": ["${PublicSubnetA}", "${PublicSubnetB}"]
+                  }
+                },
+                "Overrides": {
+                  "ContainerOverrides": [
+                    {
+                      "Name": "longview-autotrade",
+                      "Command.$": "States.Array('node', 'scripts/aws-task.mjs', $.command)",
+                      "Environment": [
+                        {
+                          "Name": "AUTOTRADE_TASK_SOURCE",
+                          "Value.$": "$.source"
+                        },
+                        {
+                          "Name": "AUTOTRADE_EXECUTION_ID",
+                          "Value.$": "$$.Execution.Id"
+                        },
+                        {
+                          "Name": "AUTOTRADE_SCHEDULED_AT",
+                          "Value.$": "$.scheduledAt"
+                        },
+                        {
+                          "Name": "AUTOTRADE_SCHEDULE_ARN",
+                          "Value.$": "$.scheduleArn"
+                        },
+                        {
+                          "Name": "AUTOTRADE_SCHEDULE_SLOT",
+                          "Value.$": "$.reconcileSlot"
+                        },
+                        {
+                          "Name": "AUTOTRADE_FINAL_RECONCILE",
+                          "Value.$": "$.finalReconcile"
+                        }
+                      ]
+                    }
+                  ]
+                }
+              },
+              "ResultPath": "$.task",
+              "Catch": [
+                {
+                  "ErrorEquals": ["States.ALL"],
+                  "ResultPath": "$.failure",
+                  "Next": "NotifyFailure"
+                }
+              ],
+              "Next": "CheckTradingExitCode"
+            },
+            "CheckTradingExitCode": {
+              "Type": "Choice",
+              "Choices": [
+                {
+                  "And": [
+                    {
+                      "Variable": "$.task.Containers[0].ExitCode",
+                      "IsPresent": true
+                    },
+                    {
+                      "Variable": "$.task.Containers[0].ExitCode",
+                      "NumericEquals": 0
+                    }
+                  ],
+                  "Next": "CommandSucceeded"
+                },
+                {
+                  "And": [
+                    {
+                      "Variable": "$.task.containers[0].exitCode",
+                      "IsPresent": true
+                    },
+                    {
+                      "Variable": "$.task.containers[0].exitCode",
+                      "NumericEquals": 0
+                    }
+                  ],
+                  "Next": "CommandSucceeded"
+                }
+              ],
+              "Default": "CaptureNonzeroExit"
+            },
+            "CaptureNonzeroExit": {
+              "Type": "Pass",
+              "Result": {
+                "Error": "ECS_CONTAINER_EXIT_NONZERO"
+              },
+              "ResultPath": "$.failure",
+              "Next": "NotifyFailure"
+            },
+            "CommandSucceeded": {
+              "Type": "Succeed"
+            },
+            "NotifyFailure": {
+              "Type": "Task",
+              "Resource": "arn:${AWS::Partition}:states:::sns:publish",
+              "Parameters": {
+                "TopicArn": "${AlertTopic}",
+                "Subject": "Longview AWS task failed",
+                "Message.$": "States.Format('Execution {} failed for command {} with error {}. Inspect the Step Functions and ECS logs; no automatic task retry was attempted.', $$.Execution.Name, $.command, $.failure.Error)"
+              },
+              "Next": "CommandFailed"
+            },
+            "InvalidCommand": {
+              "Type": "Fail",
+              "Error": "INVALID_AUTOTRADE_COMMAND",
+              "Cause": "Allowed trading commands are auto, reconcile, and audit."
+            },
+            "CommandFailed": {
+              "Type": "Fail",
+              "Error": "AUTOTRADE_TASK_FAILED",
+              "Cause": "The one-shot Fargate task failed. Review the redacted logs before retrying."
+            }
+          }
+        }
+      LoggingConfiguration:
+        Destinations:
+          - CloudWatchLogsLogGroup:
+              LogGroupArn: !GetAtt StateMachineLogGroup.Arn
+        IncludeExecutionData: false
+        Level: ERROR
+      RoleArn: !GetAtt StateMachineRole.Arn
+      StateMachineType: STANDARD
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  DataSyncStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      DefinitionString: !Sub |
+        {
+          "Comment": "Build, validate, and atomically publish one immutable market revision",
+          "StartAt": "ValidateSyncCommand",
+          "TimeoutSeconds": 9100,
+          "States": {
+            "ValidateSyncCommand": {
+              "Type": "Choice",
+              "Choices": [
+                {
+                  "Variable": "$.command",
+                  "StringEquals": "sync",
+                  "Next": "RunDataSync"
+                }
+              ],
+              "Default": "InvalidCommand"
+            },
+            "RunDataSync": {
+              "Type": "Task",
+              "Resource": "arn:${AWS::Partition}:states:::ecs:runTask.sync",
+              "TimeoutSeconds": 9000,
+              "Parameters": {
+                "Cluster": "${EcsCluster}",
+                "TaskDefinition": "${DataSyncTaskDefinition}",
+                "LaunchType": "FARGATE",
+                "PlatformVersion": "LATEST",
+                "NetworkConfiguration": {
+                  "AwsvpcConfiguration": {
+                    "AssignPublicIp": "ENABLED",
+                    "SecurityGroups": ["${TaskSecurityGroup}"],
+                    "Subnets": ["${PublicSubnetA}", "${PublicSubnetB}"]
+                  }
+                },
+                "Overrides": {
+                  "ContainerOverrides": [
+                    {
+                      "Name": "longview-autotrade",
+                      "Command.$": "States.Array('node', 'scripts/aws-task.mjs', $.command)",
+                      "Environment": [
+                        {
+                          "Name": "AUTOTRADE_TASK_SOURCE",
+                          "Value.$": "$.source"
+                        },
+                        {
+                          "Name": "AUTOTRADE_EXECUTION_ID",
+                          "Value.$": "$$.Execution.Id"
+                        },
+                        {
+                          "Name": "AUTOTRADE_SCHEDULED_AT",
+                          "Value.$": "$.scheduledAt"
+                        },
+                        {
+                          "Name": "AUTOTRADE_SCHEDULE_ARN",
+                          "Value.$": "$.scheduleArn"
+                        },
+                        {
+                          "Name": "AUTOTRADE_SCHEDULE_SLOT",
+                          "Value.$": "$.reconcileSlot"
+                        },
+                        {
+                          "Name": "AUTOTRADE_FINAL_RECONCILE",
+                          "Value.$": "$.finalReconcile"
+                        }
+                      ]
+                    }
+                  ]
+                }
+              },
+              "ResultPath": "$.task",
+              "Catch": [
+                {
+                  "ErrorEquals": ["States.ALL"],
+                  "ResultPath": "$.failure",
+                  "Next": "NotifyFailure"
+                }
+              ],
+              "Next": "CheckSyncExitCode"
+            },
+            "CheckSyncExitCode": {
+              "Type": "Choice",
+              "Choices": [
+                {
+                  "And": [
+                    {
+                      "Variable": "$.task.Containers[0].ExitCode",
+                      "IsPresent": true
+                    },
+                    {
+                      "Variable": "$.task.Containers[0].ExitCode",
+                      "NumericEquals": 0
+                    }
+                  ],
+                  "Next": "CommandSucceeded"
+                },
+                {
+                  "And": [
+                    {
+                      "Variable": "$.task.containers[0].exitCode",
+                      "IsPresent": true
+                    },
+                    {
+                      "Variable": "$.task.containers[0].exitCode",
+                      "NumericEquals": 0
+                    }
+                  ],
+                  "Next": "CommandSucceeded"
+                }
+              ],
+              "Default": "CaptureNonzeroExit"
+            },
+            "CaptureNonzeroExit": {
+              "Type": "Pass",
+              "Result": {
+                "Error": "ECS_CONTAINER_EXIT_NONZERO"
+              },
+              "ResultPath": "$.failure",
+              "Next": "NotifyFailure"
+            },
+            "CommandSucceeded": {
+              "Type": "Succeed"
+            },
+            "NotifyFailure": {
+              "Type": "Task",
+              "Resource": "arn:${AWS::Partition}:states:::sns:publish",
+              "Parameters": {
+                "TopicArn": "${AlertTopic}",
+                "Subject": "Longview AWS data sync failed",
+                "Message.$": "States.Format('Execution {} failed for data command {} with error {}. The latest manifest was not advanced automatically.', $$.Execution.Name, $.command, $.failure.Error)"
+              },
+              "Next": "CommandFailed"
+            },
+            "InvalidCommand": {
+              "Type": "Fail",
+              "Error": "INVALID_DATA_COMMAND",
+              "Cause": "The data state machine accepts only the sync command."
+            },
+            "CommandFailed": {
+              "Type": "Fail",
+              "Error": "DATA_SYNC_TASK_FAILED",
+              "Cause": "The data-sync Fargate task failed. The previous latest revision remains active."
+            }
+          }
+        }
+      LoggingConfiguration:
+        Destinations:
+          - CloudWatchLogsLogGroup:
+              LogGroupArn: !GetAtt StateMachineLogGroup.Arn
+        IncludeExecutionData: false
+        Level: ERROR
+      RoleArn: !GetAtt StateMachineRole.Arn
+      StateMachineType: STANDARD
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  SchedulerGroup:
+    Type: AWS::Scheduler::ScheduleGroup
+    Properties:
+      Name: !Sub ${ProjectName}-${EnvironmentName}-schedules
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  SchedulerInvocationRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: scheduler.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+              ArnLike:
+                aws:SourceArn: !Sub >-
+                  arn:${AWS::Partition}:scheduler:${AWS::Region}:${AWS::AccountId}:schedule/${SchedulerGroup}/*
+      Policies:
+        - PolicyName: start-exact-state-machine
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: StartLongviewStateMachines
+                Effect: Allow
+                Action:
+                  - states:StartExecution
+                Resource:
+                  - !Ref AutotradeStateMachine
+                  - !Ref DataSyncStateMachine
+              - Sid: WriteUndeliverableEvents
+                Effect: Allow
+                Action:
+                  - sqs:SendMessage
+                Resource: !GetAtt SchedulerDeadLetterQueue.Arn
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  DailyAutoSchedule:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      Description: Idempotent portfolio decision with same-day recovery attempts
+      Name: !Sub ${ProjectName}-${EnvironmentName}-auto
+      FlexibleTimeWindow:
+        Mode: "OFF"
+      GroupName: !Ref SchedulerGroup
+      ScheduleExpression: "cron(10,40 9-14 ? * MON-FRI *)"
+      ScheduleExpressionTimezone: Asia/Seoul
+      State: !If
+        - TradingScheduleEnabled
+        - ENABLED
+        - DISABLED
+      Target:
+        Arn: !Ref AutotradeStateMachine
+        DeadLetterConfig:
+          Arn: !GetAtt SchedulerDeadLetterQueue.Arn
+        Input: |
+          {
+            "source": "eventbridge-scheduler",
+            "command": "auto",
+            "triggerId": "<aws.scheduler.execution-id>",
+            "scheduledAt": "<aws.scheduler.scheduled-time>",
+            "scheduleArn": "<aws.scheduler.schedule-arn>",
+            "reconcileSlot": "auto",
+            "finalReconcile": "false"
+          }
+        RetryPolicy:
+          MaximumEventAgeInSeconds: 600
+          MaximumRetryAttempts: 0
+        RoleArn: !GetAtt SchedulerInvocationRole.Arn
+
+  ReconcileCloseSchedule:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      Description: Cancel open orders and begin close reconciliation
+      Name: !Sub ${ProjectName}-${EnvironmentName}-reconcile-close
+      FlexibleTimeWindow:
+        Mode: "OFF"
+      GroupName: !Ref SchedulerGroup
+      ScheduleExpression: "cron(13 15 ? * MON-FRI *)"
+      ScheduleExpressionTimezone: Asia/Seoul
+      State: !If
+        - TradingScheduleEnabled
+        - ENABLED
+        - DISABLED
+      Target:
+        Arn: !Ref AutotradeStateMachine
+        DeadLetterConfig:
+          Arn: !GetAtt SchedulerDeadLetterQueue.Arn
+        Input: |
+          {
+            "source": "eventbridge-scheduler",
+            "command": "reconcile",
+            "triggerId": "<aws.scheduler.execution-id>",
+            "scheduledAt": "<aws.scheduler.scheduled-time>",
+            "scheduleArn": "<aws.scheduler.schedule-arn>",
+            "reconcileSlot": "reconcile-close",
+            "finalReconcile": "false"
+          }
+        RetryPolicy:
+          MaximumEventAgeInSeconds: 600
+          MaximumRetryAttempts: 0
+        RoleArn: !GetAtt SchedulerInvocationRole.Arn
+
+  ReconcileVerifySchedule:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      Description: First independent post-15:40 not_found verification
+      Name: !Sub ${ProjectName}-${EnvironmentName}-reconcile-verify
+      FlexibleTimeWindow:
+        Mode: "OFF"
+      GroupName: !Ref SchedulerGroup
+      ScheduleExpression: "cron(45 15 ? * MON-FRI *)"
+      ScheduleExpressionTimezone: Asia/Seoul
+      State: !If
+        - TradingScheduleEnabled
+        - ENABLED
+        - DISABLED
+      Target:
+        Arn: !Ref AutotradeStateMachine
+        DeadLetterConfig:
+          Arn: !GetAtt SchedulerDeadLetterQueue.Arn
+        Input: |
+          {
+            "source": "eventbridge-scheduler",
+            "command": "reconcile",
+            "triggerId": "<aws.scheduler.execution-id>",
+            "scheduledAt": "<aws.scheduler.scheduled-time>",
+            "scheduleArn": "<aws.scheduler.schedule-arn>",
+            "reconcileSlot": "reconcile-verify-1",
+            "finalReconcile": "false"
+          }
+        RetryPolicy:
+          MaximumEventAgeInSeconds: 600
+          MaximumRetryAttempts: 0
+        RoleArn: !GetAtt SchedulerInvocationRole.Arn
+
+  ReconcileFinalSchedule:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      Description: Final independent post-15:40 reconciliation verification
+      Name: !Sub ${ProjectName}-${EnvironmentName}-reconcile-final
+      FlexibleTimeWindow:
+        Mode: "OFF"
+      GroupName: !Ref SchedulerGroup
+      ScheduleExpression: "cron(55 15 ? * MON-FRI *)"
+      ScheduleExpressionTimezone: Asia/Seoul
+      State: !If
+        - TradingScheduleEnabled
+        - ENABLED
+        - DISABLED
+      Target:
+        Arn: !Ref AutotradeStateMachine
+        DeadLetterConfig:
+          Arn: !GetAtt SchedulerDeadLetterQueue.Arn
+        Input: |
+          {
+            "source": "eventbridge-scheduler",
+            "command": "reconcile",
+            "triggerId": "<aws.scheduler.execution-id>",
+            "scheduledAt": "<aws.scheduler.scheduled-time>",
+            "scheduleArn": "<aws.scheduler.schedule-arn>",
+            "reconcileSlot": "reconcile-final",
+            "finalReconcile": "true"
+          }
+        RetryPolicy:
+          MaximumEventAgeInSeconds: 600
+          MaximumRetryAttempts: 0
+        RoleArn: !GetAtt SchedulerInvocationRole.Arn
+
+  ReconcileFinalRetrySchedule:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      Description: Independent retry of the final reconciliation after launch delay or lease contention
+      Name: !Sub ${ProjectName}-${EnvironmentName}-reconcile-final-retry
+      FlexibleTimeWindow:
+        Mode: "OFF"
+      GroupName: !Ref SchedulerGroup
+      ScheduleExpression: "cron(5 16 ? * MON-FRI *)"
+      ScheduleExpressionTimezone: Asia/Seoul
+      State: !If
+        - TradingScheduleEnabled
+        - ENABLED
+        - DISABLED
+      Target:
+        Arn: !Ref AutotradeStateMachine
+        DeadLetterConfig:
+          Arn: !GetAtt SchedulerDeadLetterQueue.Arn
+        Input: |
+          {
+            "source": "eventbridge-scheduler",
+            "command": "reconcile",
+            "triggerId": "<aws.scheduler.execution-id>",
+            "scheduledAt": "<aws.scheduler.scheduled-time>",
+            "scheduleArn": "<aws.scheduler.schedule-arn>",
+            "reconcileSlot": "reconcile-final",
+            "finalReconcile": "true"
+          }
+        RetryPolicy:
+          MaximumEventAgeInSeconds: 600
+          MaximumRetryAttempts: 0
+        RoleArn: !GetAtt SchedulerInvocationRole.Arn
+
+  DailyAuditSchedule:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      Description: Verify a successful or explicitly safe trading cycle exists
+      Name: !Sub ${ProjectName}-${EnvironmentName}-audit
+      FlexibleTimeWindow:
+        Mode: "OFF"
+      GroupName: !Ref SchedulerGroup
+      ScheduleExpression: "cron(30,40 16 ? * MON-FRI *)"
+      ScheduleExpressionTimezone: Asia/Seoul
+      State: !If
+        - TradingScheduleEnabled
+        - ENABLED
+        - DISABLED
+      Target:
+        Arn: !Ref AutotradeStateMachine
+        DeadLetterConfig:
+          Arn: !GetAtt SchedulerDeadLetterQueue.Arn
+        Input: |
+          {
+            "source": "eventbridge-scheduler",
+            "command": "audit",
+            "triggerId": "<aws.scheduler.execution-id>",
+            "scheduledAt": "<aws.scheduler.scheduled-time>",
+            "scheduleArn": "<aws.scheduler.schedule-arn>",
+            "reconcileSlot": "audit",
+            "finalReconcile": "false"
+          }
+        RetryPolicy:
+          MaximumEventAgeInSeconds: 600
+          MaximumRetryAttempts: 0
+        RoleArn: !GetAtt SchedulerInvocationRole.Arn
+
+  DataSyncSchedule:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      Description: Idempotent data refresh at 19:35 and 22:35 KST
+      Name: !Sub ${ProjectName}-${EnvironmentName}-data-sync
+      FlexibleTimeWindow:
+        Mode: "OFF"
+      GroupName: !Ref SchedulerGroup
+      ScheduleExpression: "cron(35 19,22 ? * * *)"
+      ScheduleExpressionTimezone: Asia/Seoul
+      State: !If
+        - DataSyncScheduleEnabled
+        - ENABLED
+        - DISABLED
+      Target:
+        Arn: !Ref DataSyncStateMachine
+        DeadLetterConfig:
+          Arn: !GetAtt SchedulerDeadLetterQueue.Arn
+        Input: |
+          {
+            "source": "eventbridge-scheduler",
+            "command": "sync",
+            "triggerId": "<aws.scheduler.execution-id>",
+            "scheduledAt": "<aws.scheduler.scheduled-time>",
+            "scheduleArn": "<aws.scheduler.schedule-arn>",
+            "reconcileSlot": "sync",
+            "finalReconcile": "false"
+          }
+        RetryPolicy:
+          MaximumEventAgeInSeconds: 600
+          MaximumRetryAttempts: 0
+        RoleArn: !GetAtt SchedulerInvocationRole.Arn
+
+  StateMachineFailureAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmActions:
+        - !Ref AlertTopic
+      AlarmDescription: Any Step Functions execution failure requires review.
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: StateMachineArn
+          Value: !Ref AutotradeStateMachine
+      EvaluationPeriods: 1
+      MetricName: ExecutionsFailed
+      Namespace: AWS/States
+      Period: 300
+      Statistic: Sum
+      Threshold: 1
+      TreatMissingData: notBreaching
+
+  StateMachineTimeoutAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmActions:
+        - !Ref AlertTopic
+      AlarmDescription: A one-shot Fargate execution exceeded its hard timeout.
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: StateMachineArn
+          Value: !Ref AutotradeStateMachine
+      EvaluationPeriods: 1
+      MetricName: ExecutionsTimedOut
+      Namespace: AWS/States
+      Period: 300
+      Statistic: Sum
+      Threshold: 1
+      TreatMissingData: notBreaching
+
+  DataSyncStateMachineFailureAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmActions:
+        - !Ref AlertTopic
+      AlarmDescription: A validated market-data publication failed.
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: StateMachineArn
+          Value: !Ref DataSyncStateMachine
+      EvaluationPeriods: 1
+      MetricName: ExecutionsFailed
+      Namespace: AWS/States
+      Period: 300
+      Statistic: Sum
+      Threshold: 1
+      TreatMissingData: notBreaching
+
+  DataSyncStateMachineTimeoutAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmActions:
+        - !Ref AlertTopic
+      AlarmDescription: A data-sync Fargate execution exceeded two hours.
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: StateMachineArn
+          Value: !Ref DataSyncStateMachine
+      EvaluationPeriods: 1
+      MetricName: ExecutionsTimedOut
+      Namespace: AWS/States
+      Period: 300
+      Statistic: Sum
+      Threshold: 1
+      TreatMissingData: notBreaching
+
+  SchedulerDroppedInvocationAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmActions:
+        - !Ref AlertTopic
+      AlarmDescription: EventBridge Scheduler dropped a target invocation.
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: ScheduleGroup
+          Value: !Ref SchedulerGroup
+      EvaluationPeriods: 1
+      MetricName: InvocationDroppedCount
+      Namespace: AWS/Scheduler
+      Period: 300
+      Statistic: Sum
+      Threshold: 1
+      TreatMissingData: notBreaching
+
+  SchedulerTargetErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmActions:
+        - !Ref AlertTopic
+      AlarmDescription: Scheduler could not start a target state machine.
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: ScheduleGroup
+          Value: !Ref SchedulerGroup
+      EvaluationPeriods: 1
+      MetricName: TargetErrorCount
+      Namespace: AWS/Scheduler
+      Period: 300
+      Statistic: Sum
+      Threshold: 1
+      TreatMissingData: notBreaching
+
+  SchedulerDlqDeliveryFailureAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmActions:
+        - !Ref AlertTopic
+      AlarmDescription: Scheduler could not write a failed event to its DLQ.
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: ScheduleGroup
+          Value: !Ref SchedulerGroup
+      EvaluationPeriods: 1
+      MetricName: InvocationsFailedToBeSentToDeadLetterCount
+      Namespace: AWS/Scheduler
+      Period: 300
+      Statistic: Sum
+      Threshold: 1
+      TreatMissingData: notBreaching
+
+  SchedulerDeadLetterAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmActions:
+        - !Ref AlertTopic
+      AlarmDescription: At least one scheduler event reached the dead-letter queue.
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt SchedulerDeadLetterQueue.QueueName
+      EvaluationPeriods: 1
+      MetricName: ApproximateNumberOfMessagesVisible
+      Namespace: AWS/SQS
+      Period: 300
+      Statistic: Maximum
+      Threshold: 1
+      TreatMissingData: notBreaching
+
+  DynamoDbSystemErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmActions:
+        - !Ref AlertTopic
+      AlarmDescription: Durable trading state returned a server-side error.
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: TableName
+          Value: !Ref AutotradeStateTable
+      EvaluationPeriods: 1
+      MetricName: SystemErrors
+      Namespace: AWS/DynamoDB
+      Period: 300
+      Statistic: Sum
+      Threshold: 1
+      TreatMissingData: notBreaching
+
+  MissingTradeCycleAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: TradingScheduleEnabled
+    Properties:
+      AlarmActions:
+        - !Ref AlertTopic
+      AlarmDescription: >-
+        No successful/safely-skipped trade cycle metric was published for three
+        consecutive daily periods. The audit command provides same-day checks.
+      ComparisonOperator: LessThanThreshold
+      Dimensions:
+        - Name: StackName
+          Value: !Ref AWS::StackName
+      DatapointsToAlarm: 3
+      EvaluationPeriods: 3
+      MetricName: TradeCycleSuccess
+      Namespace: Longview/Autotrade
+      Period: 86400
+      Statistic: Sum
+      Threshold: 1
+      TreatMissingData: breaching
+
+  MissingSnapshotPublishAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: DataSyncScheduleEnabled
+    Properties:
+      AlarmActions:
+        - !Ref AlertTopic
+      AlarmDescription: No validated snapshot was published for two daily periods.
+      ComparisonOperator: LessThanThreshold
+      Dimensions:
+        - Name: StackName
+          Value: !Ref AWS::StackName
+      DatapointsToAlarm: 2
+      EvaluationPeriods: 2
+      MetricName: SnapshotPublishSuccess
+      Namespace: Longview/Autotrade
+      Period: 86400
+      Statistic: Sum
+      Threshold: 1
+      TreatMissingData: breaching
+
+  GitHubOidcProvider:
+    Type: AWS::IAM::OIDCProvider
+    Condition: CreateGitHubOidcProviderCondition
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      ClientIdList:
+        - sts.amazonaws.com
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+      Url: https://token.actions.githubusercontent.com
+
+  CloudFormationExecutionRole:
+    Type: AWS::IAM::Role
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: cloudformation.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: manage-longview-stack-resources
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: ManageDeclaredInfrastructure
+                Effect: Allow
+                Action:
+                  - cloudfront:CreateCachePolicy
+                  - cloudfront:CreateDistribution
+                  - cloudfront:CreateOriginAccessControl
+                  - cloudfront:DeleteCachePolicy
+                  - cloudfront:DeleteDistribution
+                  - cloudfront:DeleteOriginAccessControl
+                  - cloudfront:GetCachePolicy
+                  - cloudfront:GetCachePolicyConfig
+                  - cloudfront:GetDistribution
+                  - cloudfront:GetDistributionConfig
+                  - cloudfront:GetOriginAccessControl
+                  - cloudfront:GetOriginAccessControlConfig
+                  - cloudfront:ListTagsForResource
+                  - cloudfront:TagResource
+                  - cloudfront:UntagResource
+                  - cloudfront:UpdateCachePolicy
+                  - cloudfront:UpdateDistribution
+                  - cloudfront:UpdateOriginAccessControl
+                  - cloudwatch:DeleteAlarms
+                  - cloudwatch:DescribeAlarms
+                  - cloudwatch:PutMetricAlarm
+                  - dynamodb:CreateTable
+                  - dynamodb:DeleteTable
+                  - dynamodb:DescribeContinuousBackups
+                  - dynamodb:DescribeTable
+                  - dynamodb:DescribeTimeToLive
+                  - dynamodb:ListTagsOfResource
+                  - dynamodb:TagResource
+                  - dynamodb:UntagResource
+                  - dynamodb:UpdateContinuousBackups
+                  - dynamodb:UpdateTable
+                  - dynamodb:UpdateTimeToLive
+                  - ec2:AssociateRouteTable
+                  - ec2:AttachInternetGateway
+                  - ec2:AuthorizeSecurityGroupEgress
+                  - ec2:CreateInternetGateway
+                  - ec2:CreateRoute
+                  - ec2:CreateRouteTable
+                  - ec2:CreateSecurityGroup
+                  - ec2:CreateSubnet
+                  - ec2:CreateTags
+                  - ec2:CreateVpc
+                  - ec2:DeleteTags
+                  - ec2:DeleteInternetGateway
+                  - ec2:DeleteRoute
+                  - ec2:DeleteRouteTable
+                  - ec2:DeleteSecurityGroup
+                  - ec2:DeleteSubnet
+                  - ec2:DeleteVpc
+                  - ec2:Describe*
+                  - ec2:DetachInternetGateway
+                  - ec2:DisassociateRouteTable
+                  - ec2:ModifySubnetAttribute
+                  - ec2:ModifyVpcAttribute
+                  - ec2:ReplaceRoute
+                  - ec2:ReplaceRouteTableAssociation
+                  - ec2:RevokeSecurityGroupEgress
+                  - ecr:CreateRepository
+                  - ecr:DeleteLifecyclePolicy
+                  - ecr:DeleteRepository
+                  - ecr:DeleteRepositoryPolicy
+                  - ecr:DescribeRepositories
+                  - ecr:GetLifecyclePolicy
+                  - ecr:GetRepositoryPolicy
+                  - ecr:ListTagsForResource
+                  - ecr:PutImageScanningConfiguration
+                  - ecr:PutImageTagMutability
+                  - ecr:PutLifecyclePolicy
+                  - ecr:SetRepositoryPolicy
+                  - ecr:TagResource
+                  - ecr:UntagResource
+                  - ecs:CreateCluster
+                  - ecs:DeleteCluster
+                  - ecs:DeregisterTaskDefinition
+                  - ecs:DescribeClusters
+                  - ecs:DescribeTaskDefinition
+                  - ecs:ListTagsForResource
+                  - ecs:PutClusterCapacityProviders
+                  - ecs:RegisterTaskDefinition
+                  - ecs:TagResource
+                  - ecs:UntagResource
+                  - ecs:UpdateCluster
+                  - ecs:UpdateClusterSettings
+                  - logs:CreateLogGroup
+                  - logs:DeleteLogGroup
+                  - logs:DeleteRetentionPolicy
+                  - logs:DescribeLogGroups
+                  - logs:ListTagsForResource
+                  - logs:PutRetentionPolicy
+                  - logs:TagResource
+                  - logs:UntagResource
+                  - s3:CreateBucket
+                  - s3:DeleteBucket
+                  - s3:DeleteBucketPolicy
+                  - s3:GetAccelerateConfiguration
+                  - s3:GetBucketLocation
+                  - s3:GetBucketOwnershipControls
+                  - s3:GetBucketPolicy
+                  - s3:GetBucketPublicAccessBlock
+                  - s3:GetBucketTagging
+                  - s3:GetBucketVersioning
+                  - s3:GetEncryptionConfiguration
+                  - s3:GetLifecycleConfiguration
+                  - s3:ListBucket
+                  - s3:GetObject
+                  - s3:PutBucketOwnershipControls
+                  - s3:PutBucketPolicy
+                  - s3:PutBucketPublicAccessBlock
+                  - s3:PutBucketTagging
+                  - s3:PutBucketVersioning
+                  - s3:PutEncryptionConfiguration
+                  - s3:PutLifecycleConfiguration
+                  - scheduler:CreateSchedule
+                  - scheduler:CreateScheduleGroup
+                  - scheduler:DeleteSchedule
+                  - scheduler:DeleteScheduleGroup
+                  - scheduler:GetSchedule
+                  - scheduler:GetScheduleGroup
+                  - scheduler:ListSchedules
+                  - scheduler:ListTagsForResource
+                  - scheduler:TagResource
+                  - scheduler:UntagResource
+                  - scheduler:UpdateSchedule
+                  - secretsmanager:CreateSecret
+                  - secretsmanager:DeleteSecret
+                  - secretsmanager:DescribeSecret
+                  - secretsmanager:GetResourcePolicy
+                  - secretsmanager:PutResourcePolicy
+                  - secretsmanager:RemoveRegionsFromReplication
+                  - secretsmanager:ReplicateSecretToRegions
+                  - secretsmanager:RestoreSecret
+                  - secretsmanager:TagResource
+                  - secretsmanager:UntagResource
+                  - secretsmanager:UpdateSecret
+                  - sns:CreateTopic
+                  - sns:DeleteTopic
+                  - sns:GetSubscriptionAttributes
+                  - sns:GetTopicAttributes
+                  - sns:ListSubscriptionsByTopic
+                  - sns:ListTagsForResource
+                  - sns:ListTopics
+                  - sns:SetSubscriptionAttributes
+                  - sns:SetTopicAttributes
+                  - sns:Subscribe
+                  - sns:TagResource
+                  - sns:Unsubscribe
+                  - sns:UntagResource
+                  - sqs:CreateQueue
+                  - sqs:DeleteQueue
+                  - sqs:GetQueueAttributes
+                  - sqs:GetQueueUrl
+                  - sqs:ListQueueTags
+                  - sqs:SetQueueAttributes
+                  - sqs:TagQueue
+                  - sqs:UntagQueue
+                  - ssm:AddTagsToResource
+                  - ssm:DeleteParameter
+                  - ssm:GetParameter
+                  - ssm:DescribeParameters
+                  - ssm:ListTagsForResource
+                  - ssm:PutParameter
+                  - ssm:RemoveTagsFromResource
+                  - states:CreateStateMachine
+                  - states:DeleteStateMachine
+                  - states:DescribeStateMachine
+                  - states:ListTagsForResource
+                  - states:TagResource
+                  - states:UntagResource
+                  - states:UpdateStateMachine
+                  - states:UpdateStateMachineAlias
+                Resource: "*"
+              - Sid: ReadExistingRetainedIamResources
+                Effect: Allow
+                Action:
+                  - iam:GetOpenIDConnectProvider
+                  - iam:GetRole
+                  - iam:GetRolePolicy
+                  - iam:ListAttachedRolePolicies
+                  - iam:ListOpenIDConnectProviderTags
+                  - iam:ListRolePolicies
+                  - iam:ListRoles
+                Resource: "*"
+              - Sid: PassOnlyEcsRuntimeRoles
+                Effect: Allow
+                Action:
+                  - iam:PassRole
+                Resource:
+                  - !GetAtt TaskExecutionRole.Arn
+                  - !GetAtt TradingTaskRole.Arn
+                  - !GetAtt DataSyncTaskRole.Arn
+                Condition:
+                  StringEquals:
+                    iam:PassedToService: ecs-tasks.amazonaws.com
+              - Sid: PassOnlyStateMachineRole
+                Effect: Allow
+                Action:
+                  - iam:PassRole
+                Resource: !GetAtt StateMachineRole.Arn
+                Condition:
+                  StringEquals:
+                    iam:PassedToService: states.amazonaws.com
+              - Sid: PassOnlySchedulerRole
+                Effect: Allow
+                Action:
+                  - iam:PassRole
+                Resource: !GetAtt SchedulerInvocationRole.Arn
+                Condition:
+                  StringEquals:
+                    iam:PassedToService: scheduler.amazonaws.com
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  GitHubDeployRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: !If
+                - CreateGitHubOidcProviderCondition
+                - !Ref GitHubOidcProvider
+                - !Ref ExistingGitHubOidcProviderArn
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                token.actions.githubusercontent.com:aud: sts.amazonaws.com
+                token.actions.githubusercontent.com:sub: !Sub >-
+                  repo:${GitHubRepository}:environment:${GitHubDeployEnvironment}
+      Policies:
+        - PolicyName: push-image-and-update-this-stack
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: GetEcrAuthorizationToken
+                Effect: Allow
+                Action:
+                  - ecr:GetAuthorizationToken
+                Resource: "*"
+              - Sid: PushOnlyThisRepository
+                Effect: Allow
+                Action:
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:BatchGetImage
+                  - ecr:CompleteLayerUpload
+                  - ecr:DescribeImages
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:InitiateLayerUpload
+                  - ecr:ListImages
+                  - ecr:PutImage
+                  - ecr:UploadLayerPart
+                Resource: !GetAtt ContainerRepository.Arn
+              - Sid: UploadLargeTemplateToPrivateDeploymentPrefix
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                Resource: !Sub ${SnapshotBucket.Arn}/deployment/*
+              - Sid: LocateDeploymentBucket
+                Effect: Allow
+                Action:
+                  - s3:GetBucketLocation
+                Resource: !GetAtt SnapshotBucket.Arn
+              - Sid: ListPrivateDeploymentPrefix
+                Effect: Allow
+                Action:
+                  - s3:ListBucket
+                Resource: !GetAtt SnapshotBucket.Arn
+                Condition:
+                  StringLike:
+                    s3:prefix:
+                      - deployment/*
+              - Sid: InspectAndUpdateOnlyThisStack
+                Effect: Allow
+                Action:
+                  - cloudformation:CreateChangeSet
+                  - cloudformation:DeleteChangeSet
+                  - cloudformation:DescribeChangeSet
+                  - cloudformation:DescribeStackEvents
+                  - cloudformation:DescribeStacks
+                  - cloudformation:ExecuteChangeSet
+                  - cloudformation:GetTemplate
+                Resource:
+                  - !Sub >-
+                    arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${AWS::StackName}/*
+                  - !Sub >-
+                    arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:changeSet/*/*
+              - Sid: InspectUploadedTemplateBeforeChangeSet
+                Effect: Allow
+                Action:
+                  - cloudformation:GetTemplateSummary
+                Resource: "*"
+              - Sid: PassOnlyThisCloudFormationExecutionRole
+                Effect: Allow
+                Action:
+                  - iam:PassRole
+                Resource: !GetAtt CloudFormationExecutionRole.Arn
+                Condition:
+                  StringEquals:
+                    iam:PassedToService: cloudformation.amazonaws.com
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  GitHubBootstrapRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: !If
+                - CreateGitHubOidcProviderCondition
+                - !Ref GitHubOidcProvider
+                - !Ref ExistingGitHubOidcProviderArn
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                token.actions.githubusercontent.com:aud: sts.amazonaws.com
+                token.actions.githubusercontent.com:sub: !Sub >-
+                  repo:${GitHubRepository}:environment:${GitHubDeployEnvironment}
+      Policies:
+        - PolicyName: bootstrap-secrets-and-state
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: InspectOnlyThisStack
+                Effect: Allow
+                Action:
+                  - cloudformation:DescribeStacks
+                Resource: !Sub >-
+                  arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${AWS::StackName}/*
+              - Sid: SeedOnlyAutotradeSecrets
+                Effect: Allow
+                Action:
+                  - secretsmanager:DescribeSecret
+                  - secretsmanager:PutSecretValue
+                Resource:
+                  - !Ref KisCredentialsSecret
+                  - !Ref MarketDataCredentialsSecret
+              - Sid: MigrateOnlyAutotradeState
+                Effect: Allow
+                Action:
+                  - dynamodb:DeleteItem
+                  - dynamodb:DescribeTable
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                Resource: !GetAtt AutotradeStateTable.Arn
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+Outputs:
+  Region:
+    Description: Deploy and run this stack in the Seoul region.
+    Value: !Ref AWS::Region
+
+  EcrRepositoryUri:
+    Description: Push commit-SHA-tagged images here.
+    Value: !GetAtt ContainerRepository.RepositoryUri
+
+  EcrRepositoryName:
+    Value: !Ref ContainerRepository
+
+  StateMachineArn:
+    Description: Use this for safe manual dry-run StartExecution tests.
+    Value: !Ref AutotradeStateMachine
+
+  DataSyncStateMachineArn:
+    Description: Runs only the two-hour sync and atomic publication command.
+    Value: !Ref DataSyncStateMachine
+
+  EcsClusterArn:
+    Value: !GetAtt EcsCluster.Arn
+
+  TradingTaskDefinitionArn:
+    Value: !Ref TradingTaskDefinition
+
+  DataSyncTaskDefinitionArn:
+    Value: !Ref DataSyncTaskDefinition
+
+  StateTableName:
+    Value: !Ref AutotradeStateTable
+
+  SnapshotBucketName:
+    Value: !Ref SnapshotBucket
+
+  SnapshotPublicBaseUrl:
+    Description: Read-only CloudFront base URL for validated snapshot artifacts.
+    Value: !Sub https://${SnapshotDistribution.DomainName}
+
+  LatestManifestUrl:
+    Description: >-
+      The website reads this small manifest, then the immutable revision paths
+      and checksums named by it.
+    Value: !Sub https://${SnapshotDistribution.DomainName}/latest/manifest.json
+
+  KisSecretArn:
+    Description: Populate this secret out of band; it initially has no value.
+    Value: !Ref KisCredentialsSecret
+
+  MarketDataSecretArn:
+    Description: Populate DART and data.go.kr credentials out of band.
+    Value: !Ref MarketDataCredentialsSecret
+
+  KillSwitchParameterName:
+    Description: true blocks live orders. The initial value is true.
+    Value: !Ref KillSwitchParameter
+
+  AlertTopicArn:
+    Value: !Ref AlertTopic
+
+  SchedulerDeadLetterQueueUrl:
+    Value: !Ref SchedulerDeadLetterQueue
+
+  GitHubDeployRoleArn:
+    Description: Store as the non-secret GitHub variable AWS_DEPLOY_ROLE_ARN.
+    Value: !GetAtt GitHubDeployRole.Arn
+
+  GitHubBootstrapRoleArn:
+    Description: >-
+      Use for the one-time manual GitHub bootstrap that seeds Secrets Manager
+      and migrates legacy state.
+    Value: !GetAtt GitHubBootstrapRole.Arn
+
+  CloudFormationExecutionRoleArn:
+    Description: >-
+      Store as the non-secret GitHub variable AWS_CLOUDFORMATION_ROLE_ARN.
+    Value: !GetAtt CloudFormationExecutionRole.Arn
+
+  SafetyStatus:
+    Value: !Sub >-
+      executionMode=${ExecutionMode}, tradingSchedule=${EnableTradingSchedule},
+      dataSchedule=${EnableDataSyncSchedule}, durableKillSwitch=true-at-bootstrap

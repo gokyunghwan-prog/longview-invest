@@ -315,6 +315,166 @@ test("원격 모드는 추적 파일을 건드리지 않고 runtime snapshot으�
   assert.equal(health.remoteSnapshot.source, "remote");
 });
 
+test("CloudFront manifest 모드는 원자적 bundle 갱신이 끝난 뒤에만 서버를 연다", async (t) => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "longview-bundle-api-"));
+  const dataFile = path.join(directory, "tracked-companies.json");
+  const runtimeDataFile = path.join(directory, ".cache", "companies.json");
+  const runtimeSelectionFile = path.join(
+    directory,
+    ".cache",
+    "trading-selection.json"
+  );
+  const publicDir = path.join(directory, "public");
+  await mkdir(path.dirname(runtimeDataFile), { recursive: true });
+  await mkdir(publicDir);
+  await writeFile(dataFile, JSON.stringify(snapshot([company(1)])), "utf8");
+  await writeFile(runtimeDataFile, JSON.stringify(snapshot([company(1)])), "utf8");
+  await generateInvestmentSelectionFile({
+    dataFile: runtimeDataFile,
+    outputFile: runtimeSelectionFile,
+    now: new Date("2026-07-19T00:00:00.000Z")
+  });
+
+  let releaseRefresh;
+  const refreshGate = new Promise((resolve) => {
+    releaseRefresh = resolve;
+  });
+  const config = {
+    dataFile,
+    runtimeDataFile,
+    runtimeInvestmentSelectionFile: runtimeSelectionFile,
+    investmentSelectionFile: runtimeSelectionFile,
+    publicDir,
+    remoteArtifactManifestUrl:
+      "https://example.cloudfront.net/latest/manifest.json",
+    remoteSnapshotToken: "",
+    remoteSnapshotRefreshMs: 60_000,
+    remoteStartupRefreshRequired: true,
+    host: "127.0.0.1",
+    port: 0,
+    schedulerEnabled: false,
+    scheduleHourKst: 21,
+    syncToken: ""
+  };
+  const app = await createLongviewApp(config, {
+    storeOptions: {
+      refreshIntervalMs: 0,
+      now: () => Date.parse("2026-07-19T00:00:00.000Z")
+    },
+    runtimeSnapshotPreparer: async () => ({
+      dataFile: runtimeDataFile,
+      source: "local",
+      etag: null
+    }),
+    runtimeSelectionPreparer: async () => ({ file: runtimeSelectionFile }),
+    remoteBundleRefresher: async () => {
+      await refreshGate;
+      await writeFile(
+        runtimeDataFile,
+        JSON.stringify(
+          snapshot([company(1), company(2)], "2026-07-19T00:00:00.000Z")
+        ),
+        "utf8"
+      );
+      await generateInvestmentSelectionFile({
+        dataFile: runtimeDataFile,
+        outputFile: runtimeSelectionFile,
+        now: new Date("2026-07-19T00:00:00.000Z")
+      });
+      return {
+        attempted: true,
+        success: true,
+        changed: true,
+        revision: "test-revision",
+        updatedAt: "2026-07-19T00:00:00.000Z"
+      };
+    }
+  });
+  t.after(async () => {
+    await app.close();
+    await rm(directory, { recursive: true, force: true });
+  });
+
+  const listening = app.listen();
+  const beforeRelease = await Promise.race([
+    listening.then(() => "listening"),
+    new Promise((resolve) => setImmediate(() => resolve("blocked")))
+  ]);
+  assert.equal(beforeRelease, "blocked");
+  assert.equal(app.server.listening, false);
+
+  releaseRefresh();
+  const address = await listening;
+  const overview = await (
+    await fetch(`http://127.0.0.1:${address.port}/api/overview`)
+  ).json();
+  assert.equal(overview.summary.companies, 2);
+});
+
+test("필수 CloudFront bundle을 못 받으면 이전 파일이 있어도 서버 시작을 차단한다", async (t) => {
+  const directory = await mkdtemp(
+    path.join(os.tmpdir(), "longview-bundle-startup-fail-")
+  );
+  const dataFile = path.join(directory, "tracked-companies.json");
+  const runtimeDataFile = path.join(directory, ".cache", "companies.json");
+  const runtimeSelectionFile = path.join(
+    directory,
+    ".cache",
+    "trading-selection.json"
+  );
+  const publicDir = path.join(directory, "public");
+  await mkdir(path.dirname(runtimeDataFile), { recursive: true });
+  await mkdir(publicDir);
+  await writeFile(dataFile, JSON.stringify(snapshot([company(1)])), "utf8");
+  await writeFile(runtimeDataFile, JSON.stringify(snapshot([company(1)])), "utf8");
+  await generateInvestmentSelectionFile({
+    dataFile: runtimeDataFile,
+    outputFile: runtimeSelectionFile,
+    now: new Date("2026-07-19T00:00:00.000Z")
+  });
+
+  const app = await createLongviewApp(
+    {
+      dataFile,
+      runtimeDataFile,
+      runtimeInvestmentSelectionFile: runtimeSelectionFile,
+      investmentSelectionFile: runtimeSelectionFile,
+      publicDir,
+      remoteArtifactManifestUrl:
+        "https://example.cloudfront.net/latest/manifest.json",
+      remoteSnapshotToken: "",
+      remoteSnapshotRefreshMs: 60_000,
+      remoteStartupRefreshRequired: true,
+      host: "127.0.0.1",
+      port: 0,
+      schedulerEnabled: false,
+      scheduleHourKst: 21,
+      syncToken: ""
+    },
+    {
+      runtimeSnapshotPreparer: async () => ({
+        dataFile: runtimeDataFile,
+        source: "local",
+        etag: null
+      }),
+      runtimeSelectionPreparer: async () => ({ file: runtimeSelectionFile }),
+      remoteBundleRefresher: async () => ({
+        attempted: true,
+        success: false,
+        changed: false,
+        error: "manifest checksum failure"
+      })
+    }
+  );
+  t.after(async () => {
+    await app.close();
+    await rm(directory, { recursive: true, force: true });
+  });
+
+  await assert.rejects(app.listen(), /manifest checksum failure/);
+  assert.equal(app.server.listening, false);
+});
+
 test("민감정보 없는 최신 자동투자 선정 산출물만 API로 공개한다", async (t) => {
   const directory = await mkdtemp(path.join(os.tmpdir(), "longview-selection-api-"));
   const dataFile = path.join(directory, "companies.json");
